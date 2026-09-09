@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for Polar support updates every six hours
+
+[Timer]
+OnBootSec=20min
+OnUnitInactiveSec=6h
+RandomizedDelaySec=20min
+
+[Install]
+WantedBy=timers.target

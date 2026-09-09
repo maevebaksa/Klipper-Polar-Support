@@ -1,0 +1,8 @@
+[Unit]
+Description=Rebuild and relink Klipper Polar support
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 @@PROJECT_ROOT@@/apply_update.py --user @@USER@@ --klipper @@KLIPPER_ROOT@@
+TimeoutStartSec=5min

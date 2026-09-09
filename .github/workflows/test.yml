@@ -1,0 +1,41 @@
+name: Test Polar support
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Fetch tested Klipper baseline
+        run: |
+          git clone --filter=blob:none https://github.com/Klipper3d/klipper.git /tmp/klipper
+          git -C /tmp/klipper checkout f0892d82b0f1c1228454f09eb508eddde2250f4b
+          pip install -r /tmp/klipper/scripts/klippy-requirements.txt
+          python3 install.py --klipper /tmp/klipper --sync
+      - name: Test clean-checkout integration
+        env:
+          KLIPPER_PATH: /tmp/klipper
+          PYTHONPATH: /tmp/klipper/klippy
+        run: |
+          bash -n install.sh
+          python3 -m py_compile install.py auto_update.py klippy/kinematics/polar_center.py
+          python3 -m unittest discover -s tests -v
+      - name: Real Klippy motion simulation
+        run: |
+          printf 'CONFIG_MACH_SIMU=y\n' > /tmp/klipper/.config
+          make -C /tmp/klipper olddefconfig
+          make -C /tmp/klipper -j2
+          python3 tests/run_integration.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-results
+          test -z "$(git -C /tmp/klipper status --porcelain --untracked-files=no)"

@@ -1,0 +1,12 @@
+[Unit]
+Description=Install an available Polar support update while idle
+After=moonraker.service network-online.target
+
+[Service]
+Type=oneshot
+User=@@USER@@
+ExecStart=/usr/bin/python3 @@PROJECT_ROOT@@/auto_update.py
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+MemoryMax=64M

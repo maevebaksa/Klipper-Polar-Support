@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Real Klippy + compiled C step generation in MCU file-output mode.
+
+Use a hostsimulator dictionary built by Klipper. No printer is contacted.
+"""
+import argparse
+import json
+import math
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--klipper', required=True, type=Path)
+    parser.add_argument('--dictionary', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path)
+    args = parser.parse_args()
+    root, out = args.klipper.resolve(), args.output.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    sample = Path(__file__).parents[1]/'config/polar3d-printrboard-center.cfg'
+    config = re.sub(r'^#.*\n', '', sample.read_text(), flags=re.M)
+    pins = iter(range(1, 30))
+    config = re.sub(r'(?m)^((?:\w+_pin|pin):\s*)[!^]*P[A-F]\d+',
+                    lambda m: m[1]+str(next(pins)), config)
+    config = config.replace('min_extrude_temp: 170', 'min_extrude_temp: 0')
+    config = config.replace('sensor_type: EPCOS 100K B57560G104F',
+                            'sensor_type: temperature_host')
+    temp = out/'temperature'
+    temp.write_text('25000\n')
+    config = re.sub(r'(?m)^sensor_pin:.*$', 'sensor_path: '+str(temp), config)
+    config += '\n[force_move]\nenable_force_move: True\n[polar_center_audit]\n[gcode_arcs]\n'
+    # Deliberately test pressure advance as well as synchronized XYZ/E.
+    config = config.replace('[extruder]', '[extruder]\npressure_advance: 0.04')
+    cfg = out/'simulation.cfg'
+    cfg.write_text(config)
+    commands = ['G28', 'G90', 'M82', 'G1 Z10 F180', 'G1 X30 Y0 F600',
+                'POLAR_TEST_ANCHOR', 'POLAR_TEST_POSITION X=30 Y=0 Z=10 E=0']
+    e = 0.
+    expected_endpoints = 1
+    def move(x, y, z=10., extrude=0., speed=2400):
+        nonlocal e, expected_endpoints
+        e += extrude
+        commands.append('G1 X%.9f Y%.9f Z%.9f E%.9f F%d' % (x,y,z,e,speed))
+        commands.append('POLAR_TEST_POSITION X=%.9f Y=%.9f Z=%.9f E=%.9f' % (x,y,z,e))
+        expected_endpoints += 1
+    # Exact crossings and separate arrival / dwell / departure in all quadrants.
+    for angle in [0, .3, math.pi/2, math.pi, -math.pi/2, 2.9]:
+        x, y = 30*math.cos(angle), 30*math.sin(angle)
+        move(x, y)
+        move(-x, -y, 11., .5)
+        move(0, 0, 11., .1)
+        commands += ['G4 P100', 'G1 Z12 F180', 'G1 E%.9f F60' % (e-.5),
+                     'G1 E%.9f F60' % e]
+        move(y, -x, 12., .1)
+    # Repeated reversals detect accumulated rounding errors in 14:3 gearing.
+    move(30, 0)
+    for i in range(120):
+        move(-30 if i%2==0 else 30, 0, 10., .02)
+    # Near-center paths preserve the offset and stay finite at both high/low F.
+    for offset in [1.e-6, .001, .01, .1, 1., 5.]:
+        move(-30, offset)
+        move(30, offset, 11., .5, 300)
+        move(-30, -offset, 10., .5)
+    # Multiple full rotations, reversals, and atan2 branch-cut transitions.
+    for i in range(65):
+        a = 4*math.pi*i/64
+        move(20*math.cos(a), 20*math.sin(a), extrude=.01)
+    # Queued moves without an audit flush at each junction, G2/G3, and
+    # relative coordinates/extrusion all use the native toolhead path.
+    commands += ['G1 X20 Y0 F1200', 'G1 X0 Y20', 'G1 X-20 Y0',
+                 'G1 X20 Y0', 'G1 X0 Y0', 'G1 X0 Y-20', 'G1 X0 Y0',
+                 'G1 X20 Y0', 'G3 X0 Y0 I-10 J0 F600',
+                 'G2 X20 Y0 I10 J0 F600', 'G91', 'M83',
+                 'G1 X-40 Y0 E0.1 F600', 'G90', 'M82']
+    e += .1
+    move(30, 0)
+    # Invalid endpoints and extrusion must not queue the first half of a line.
+    move(30, 0)
+    commands += ['POLAR_TEST_REJECT X=-101', 'POLAR_TEST_REJECT X=-30 Z=151',
+                 'POLAR_TEST_REJECT X=-30 E=10000']
+    commands += ['M18', 'POLAR_TEST_REJECT X=-30']
+    # Homing after multiple rotations, then fresh coordinate-frame anchor.
+    commands += ['G28', 'G1 Z10 F180', 'G1 X30 Y0 F600', 'POLAR_TEST_ANCHOR']
+    move(-30, 0)
+    commands += ['M400']
+    gcode = out/'regression.gcode'
+    gcode.write_text('\n'.join(commands)+'\n')
+    audit = root/'klippy/extras/polar_center_audit.py'
+    old = audit.read_bytes() if audit.exists() else None
+    audit.write_bytes(Path(__file__).with_name('polar_center_audit.py').read_bytes())
+    log = out/'klippy.log'
+    log.unlink(missing_ok=True)
+    try:
+        process = subprocess.run([sys.executable, str(root/'klippy/klippy.py'), str(cfg),
+                                  '-i', str(gcode), '-o', str(out/'mcu-output'),
+                                  '-d', str(args.dictionary.resolve()), '-l', str(log)],
+                                 capture_output=True, text=True, timeout=120)
+    finally:
+        if old is None:
+            audit.unlink()
+        else:
+            audit.write_bytes(old)
+    text = log.read_text()
+    endpoints = text.count('POLAR_AUDIT endpoint PASS')
+    rotations = text.count('POLAR_AUDIT rotation stationary XYZ/E PASS')
+    rejected = text.count('POLAR_AUDIT rejected request atomicity PASS')
+    samples = re.findall(r'POLAR_AUDIT trajectory samples=(\d+)', text)
+    result = dict(exit_code=process.returncode, endpoint_checks=endpoints,
+                  expected_endpoints=expected_endpoints, stationary_rotations=rotations,
+                  rejected_move_checks=rejected, pressure_advance=.04,
+                  trajectory_samples=int(samples[-1]) if samples else 0,
+                  backend='Real Klippy/C helpers, hostsimulator MCU file-output')
+    result['passed'] = (process.returncode == 0 and endpoints == expected_endpoints
+                        and rotations >= 120 and rejected == 4)
+    (out/'result.json').write_text(json.dumps(result, indent=2)+'\n')
+    print(json.dumps(result, indent=2))
+    if not result['passed']:
+        print(process.stdout, process.stderr)
+        print(text[-8000:])
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
