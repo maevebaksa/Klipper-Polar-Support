@@ -18,6 +18,9 @@ class Audit:
         self.kin = self.th.get_kinematics()
         original_append = self.th.trapq_append
         self.trajectory_checks = 0
+        self.junction_checks = 0
+        self.moving_junctions = 0
+        self.previous_trapezoid = None
         def append(tq, start_time, accel_t, cruise_t, decel_t,
                    x, y, z, ux, uy, uz, start_v, cruise_v, accel):
             # Sample the actual trapezoids submitted to the C queue, rather
@@ -59,6 +62,28 @@ class Audit:
                                    *append.original_position,
                                    ux, uy, uz, start_v, cruise_v, accel)
         def checked_append(*args):
+            _, start_time, at, ct, dt, x, y, z, ux, uy, uz, sv, cv, accel = args
+            old = self.previous_trapezoid
+            if old is not None and abs(start_time-old[0]) < 1.e-6:
+                _, old_pos, old_u, old_v = old
+                if math.dist(old_pos, (x, y, z)) < 1.e-6:
+                    radius = math.hypot(x, y)
+                    dvx, dvy = ux*sv-old_u[0]*old_v, uy*sv-old_u[1]*old_v
+                    if radius <= 1.e-7:
+                        if abs(sv) > 1.e-6 or abs(old_v) > 1.e-6:
+                            raise self.printer.command_error('Nonzero center junction speed')
+                    else:
+                        dr = abs((x*dvx+y*dvy)/radius)
+                        da = abs((x*dvy-y*dvx)/radius**2)
+                        if dr > self.kin.radial_velocity_change+1.e-6:
+                            raise self.printer.command_error('Radial corner jump exceeds limit')
+                        if da > self.kin.angular_velocity_change+1.e-6:
+                            raise self.printer.command_error('Angular corner jump exceeds limit')
+                    self.junction_checks += 1
+                    self.moving_junctions += sv > 1.e-6
+            distance = .5*(sv+cv)*at + cv*ct + cv*dt - .5*accel*dt*dt
+            self.previous_trapezoid = (start_time+at+ct+dt,
+                (x+ux*distance, y+uy*distance, z+uz*distance), (ux,uy,uz), cv-accel*dt)
             append.original_position = args[5:8]
             return append(*args)
         self.th.trapq_append = checked_append
@@ -101,6 +126,8 @@ class Audit:
         self.checks += 1
         logging.info('POLAR_AUDIT endpoint PASS checks=%d', self.checks)
         logging.info('POLAR_AUDIT trajectory samples=%d', self.trajectory_checks)
+        logging.info('POLAR_AUDIT junction checks=%d moving=%d',
+                     self.junction_checks, self.moving_junctions)
 
     def reject(self, gcmd):
         self.th.flush_step_generation()

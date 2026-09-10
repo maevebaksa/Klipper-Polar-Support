@@ -38,4 +38,5 @@ jobs:
           make -C /tmp/klipper olddefconfig
           make -C /tmp/klipper -j2
           python3 tests/run_integration.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-results
-          test -z "$(git -C /tmp/klipper status --porcelain --untracked-files=no)"
+          python3 tests/run_corner_benchmark.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-corners
+          test -z "$(git -C /tmp/klipper status --porcelain)"

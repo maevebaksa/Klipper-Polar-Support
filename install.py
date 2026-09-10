@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from compatibility import fingerprint
 
 ROOT = Path(__file__).resolve().parent
@@ -56,49 +57,68 @@ def atomic_bytes(path, data):
             os.unlink(temporary)
 
 
-def restore_legacy(klipper, state_root):
+def git_path(klipper, name):
+    path = Path(subprocess.check_output(
+        ['git', '-C', str(klipper), 'rev-parse', '--git-path', name], text=True).strip())
+    return path if path.is_absolute() else klipper / path
+
+
+def legacy_plan(klipper):
+    """Validate all old tracked files before any installation mutation."""
     legacy = klipper / ".polar-center-upgrade"
     records_file = legacy / "installed.json"
-    if not records_file.is_file():
-        # Recover an exact known 0.1.0 patch even if its state directory was
-        # lost. HEAD is read, never reset; unrelated modifications are kept.
-        head = {name: subprocess.check_output(
-            ["git", "-C", str(klipper), "show", "HEAD:" + name])
-                for name in LEGACY_FILES}
-        current = {name: digest(klipper / name) for name in LEGACY_FILES}
-        recognized = [name for name in LEGACY_FILES
-                      if current[name] == LEGACY_INSTALLED[name]]
-        if recognized:
-            for name in LEGACY_FILES:
-                original = hashlib.sha256(head[name]).hexdigest()
-                if current[name] not in (LEGACY_INSTALLED[name], original):
-                    raise RuntimeError(f"Preserving independently modified Klipper file: {name}")
-            for name in recognized:
-                atomic_bytes(klipper / name, head[name])
-            print("Restored the exact legacy Polar patch from Klipper HEAD.")
-        return
-    records = json.loads(records_file.read_text())
+    if legacy.is_symlink():
+        raise RuntimeError('Preserving unmanaged legacy state symlink')
+    records = json.loads(records_file.read_text()) if records_file.is_file() else None
+    plan = []
     for name in LEGACY_FILES:
-        rec = records.get(name)
-        if not rec:
-            raise RuntimeError(f"Legacy installation record is missing {name}")
-        target, backup = klipper / name, legacy / "original" / name
-        if digest(target) not in (rec["installed_sha256"], rec["original_sha256"]):
-            raise RuntimeError(f"Preserving independently modified Klipper file: {name}")
-        if digest(backup) != rec["original_sha256"]:
-            raise RuntimeError(f"Legacy backup checksum mismatch: {name}")
-        head = subprocess.check_output(["git", "-C", str(klipper), "show", "HEAD:" + name])
-        if hashlib.sha256(head).hexdigest() != rec["original_sha256"]:
-            raise RuntimeError(f"Legacy backup no longer matches Klipper HEAD: {name}")
-    for name in LEGACY_FILES:
-        rec = records[name]
         target = klipper / name
-        if digest(target) == rec["installed_sha256"]:
-            shutil.copy2(legacy / "original" / name, target)
-    destination = state_root / ("legacy-patched-source-" + time.strftime("%Y%m%d-%H%M%S"))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(legacy), destination)
-    print(f"Restored tracked Klipper files; retained legacy backup at {destination}")
+        if target.is_symlink():
+            raise RuntimeError(f'Preserving unmanaged tracked-file symlink: {name}')
+        staged = subprocess.run(['git', '-C', str(klipper), 'diff', '--cached',
+                                 '--quiet', '--', name])
+        if staged.returncode:
+            raise RuntimeError(f'Preserving staged Klipper changes: {name}')
+        head = subprocess.check_output(["git", "-C", str(klipper), "show", "HEAD:" + name])
+        original = hashlib.sha256(head).hexdigest()
+        allowed = {original, LEGACY_INSTALLED[name]}
+        if records is not None:
+            rec = records.get(name)
+            if not rec or rec.get('original_sha256') != original:
+                raise RuntimeError(f'Legacy backup no longer matches Klipper HEAD: {name}')
+            backup = legacy / 'original' / name
+            if digest(backup) != original:
+                raise RuntimeError(f'Legacy backup checksum mismatch: {name}')
+            allowed.add(rec['installed_sha256'])
+        if digest(target) not in allowed:
+            raise RuntimeError(f'Preserving independently modified Klipper file: {name}')
+        mode = subprocess.check_output(['git', '-C', str(klipper), 'ls-tree',
+                                        'HEAD', '--', name], text=True).split()[0]
+        mode = 0o755 if mode == '100755' else 0o644
+        if digest(target) != original or (target.stat().st_mode & 0o777) != mode:
+            plan.append((name, head, mode))
+    return plan
+
+
+def restore_legacy(klipper, state_root):
+    plan = legacy_plan(klipper)
+    legacy = klipper / '.polar-center-upgrade'
+    if not plan and not legacy.exists():
+        return
+    destination = state_root / ('legacy-' + time.strftime('%Y%m%d-%H%M%S')
+                                + '-' + uuid.uuid4().hex[:8])
+    destination.mkdir(parents=True)
+    # Preserve patched bytes even when the old install record is missing.
+    for name, _, _ in plan:
+        backup = destination / 'patched' / name
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(klipper / name, backup)
+    for name, data, mode in plan:
+        atomic_bytes(klipper / name, data)
+        (klipper / name).chmod(mode)
+    if legacy.exists():
+        shutil.move(str(legacy), destination / 'installer-state')
+    print(f'Restored recognized legacy Polar changes; backup: {destination}')
 
 
 def build(klipper):
@@ -127,12 +147,18 @@ def build(klipper):
 
 def preflight(klipper):
     fingerprint(klipper)
-    if not (klipper / '.git/info/exclude').is_file():
-        raise RuntimeError('Klipper must have .git/info/exclude')
+    legacy_plan(klipper)
+    git_path(klipper, 'info/exclude')
+    tracked = subprocess.check_output(
+        ['git', '-C', str(klipper), 'ls-files', '--', PLUGIN_FILE], text=True)
+    if tracked.strip():
+        raise RuntimeError('polar_center.py is tracked in this Klipper checkout; '
+                           'preserving its Git history and index')
     target = klipper / PLUGIN_FILE
     if target.is_symlink() and target.resolve() != (ROOT / PLUGIN_FILE).resolve():
         raise RuntimeError('Preserving an unmanaged polar_center.py symlink')
     allowed = {digest(ROOT / PLUGIN_FILE),
+               '6e8cf8ade70dbe10275a1f031b6aae682420922881a242cf42061c959a103b7a',
                '2f82db4aa174b1f964cabaf971ada517a92db5711e1810ba25c061263faacbfd'}
     records = klipper / '.polar-center-upgrade/installed.json'
     if records.is_file():
@@ -156,13 +182,12 @@ def install_link(klipper, state_root):
         else:
             target.unlink()
     target.symlink_to(source)
-    exclude = klipper / ".git/info/exclude"
-    if not exclude.is_file():
-        raise RuntimeError("Klipper must be a Git checkout with .git/info/exclude")
+    exclude = git_path(klipper, 'info/exclude')
     marker = "/" + PLUGIN_FILE
-    lines = exclude.read_text().splitlines()
+    previous = exclude.read_text() if exclude.exists() else ''
+    lines = previous.splitlines()
     if marker not in lines:
-        atomic_write(exclude, exclude.read_text().rstrip() + "\n" + marker + "\n")
+        atomic_write(exclude, previous.rstrip() + "\n" + marker + "\n")
 
 
 def main():
@@ -184,11 +209,11 @@ def main():
     restore_legacy(klipper, state_root)
     install_link(klipper, state_root)
     changed = subprocess.check_output(
-        ["git", "-C", str(klipper), "status", "--porcelain", "--untracked-files=no"], text=True)
+        ["git", "-C", str(klipper), "status", "--porcelain"], text=True)
     if changed.strip():
-        print("WARNING: unrelated tracked Klipper modifications remain:\n" + changed.rstrip())
+        print("Other Klipper changes remain (preserved):\n" + changed.rstrip())
     else:
-        print("Klipper tracked source is clean; Polar support is linked and built.")
+        print("Klipper Git checkout is clean; Polar support is linked and built.")
 
 
 if __name__ == "__main__":

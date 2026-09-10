@@ -73,6 +73,44 @@ class InstallerTests(unittest.TestCase):
             ["git", "-C", str(self.klipper), "status", "--porcelain"], text=True), "")
         self.assertTrue(list((self.home / ".local/share/klipper-polar-support").iterdir()))
 
+    def test_unknown_tracked_edit_fails_preflight_without_mutation(self):
+        target = self.klipper / 'klippy/chelper/kin_polar.c'
+        target.write_text(target.read_text() + '\n// independent user edit\n')
+        before = target.read_bytes()
+        result = subprocess.run([sys.executable, str(ROOT / 'install.py'),
+                                 '--klipper', str(self.klipper), '--check'],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('independently modified', result.stderr)
+        self.assertEqual(target.read_bytes(), before)
+        self.assertFalse((self.klipper / 'klippy/kinematics/polar_center.py').exists())
+
+    def test_staged_changes_are_preserved(self):
+        target = self.klipper / 'klippy/chelper/kin_polar.c'
+        target.write_text(target.read_text() + '\n// staged user edit\n')
+        subprocess.run(['git', '-C', str(self.klipper), 'add', str(target)], check=True)
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('staged Klipper changes', result.stderr)
+        self.assertIn('staged user edit', target.read_text())
+
+    def test_unrelated_untracked_file_remains_visible(self):
+        target = self.klipper / 'user-notes.txt'
+        target.write_text('keep this')
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('user-notes.txt', result.stdout)
+        self.assertEqual(target.read_text(), 'keep this')
+
+    def test_tracked_plugin_is_not_hidden_or_removed(self):
+        target = self.klipper / 'klippy/kinematics/polar_center.py'
+        target.write_text('# user-tracked implementation')
+        subprocess.run(['git', '-C', str(self.klipper), 'add', str(target)], check=True)
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is tracked', result.stderr)
+        self.assertEqual(target.read_text(), '# user-tracked implementation')
+
 
 if __name__ == "__main__":
     unittest.main()

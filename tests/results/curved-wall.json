@@ -1,0 +1,19 @@
+{
+  "exact_stop": {
+    "seconds": 40.812055591165844,
+    "e_mm": 7.5996016031249995,
+    "expected_e_mm": 7.6,
+    "junctions": 724,
+    "moving_junctions": 1,
+    "trajectory_samples": 170484
+  },
+  "polar_corners": {
+    "seconds": 22.33880049252612,
+    "e_mm": 7.5996016031249995,
+    "expected_e_mm": 7.6,
+    "junctions": 724,
+    "moving_junctions": 722,
+    "trajectory_samples": 148062
+  },
+  "time_reduction_percent": 45.26421134895846
+}
