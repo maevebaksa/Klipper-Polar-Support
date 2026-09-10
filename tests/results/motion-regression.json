@@ -1,0 +1,11 @@
+{
+  "exit_code": 0,
+  "endpoint_checks": 232,
+  "expected_endpoints": 232,
+  "stationary_rotations": 146,
+  "rejected_move_checks": 4,
+  "pressure_advance": 0.04,
+  "trajectory_samples": 170598,
+  "backend": "Real Klippy/C helpers, hostsimulator MCU file-output",
+  "passed": true
+}

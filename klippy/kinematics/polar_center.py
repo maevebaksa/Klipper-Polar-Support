@@ -64,6 +64,28 @@ def derivative_bounds(start, end, move_length):
     return h / rmin**2, 2. * h * q / rmin**3, h*h / rmin**3, q
 
 
+def corner_speed_limit(position, incoming, outgoing, radial_change, angular_change):
+    """Cap path speed by the permitted motor velocity jumps at a junction.
+
+    incoming/outgoing are XYZ unit path directions. These are explicit
+    instantaneous velocity-change limits, not finite acceleration guarantees.
+    Klipper's Cartesian look-ahead and extrusion limits still apply separately.
+    """
+    x, y = position[:2]
+    radius = math.hypot(x, y)
+    if radius <= CENTER_EPS:
+        return 0.
+    dx, dy = outgoing[0] - incoming[0], outgoing[1] - incoming[1]
+    radial_jump = abs((x * dx + y * dy) / radius)
+    angular_jump = abs((x * dy - y * dx) / radius**2)
+    limit = float('inf')
+    if radial_jump:
+        limit = min(limit, radial_change / radial_jump)
+    if angular_jump:
+        limit = min(limit, angular_change / angular_jump)
+    return limit
+
+
 class PolarCenterKinematics(polar.PolarKinematics):
     def __init__(self, toolhead, config):
         plugin_root = Path(__file__).resolve().parents[2]
@@ -89,6 +111,10 @@ class PolarCenterKinematics(polar.PolarKinematics):
         self.radial_accel = config.getfloat(
             'max_radial_accel', self.max_accel, above=0.)
         self.slow_radius = config.getfloat('polar_slow_radius', 5., above=0.)
+        self.radial_velocity_change = config.getfloat(
+            'max_radial_velocity_change', min(1., self.radial_velocity), minval=0.)
+        self.angular_velocity_change = config.getfloat(
+            'max_angular_velocity_change', min(.02, self.v_rad_max), minval=0.)
         if self.rails[0].get_range()[0] != 0.:
             raise config.error("polar_center requires arm position_min: 0")
         self.bed = self.steppers[0]
@@ -151,9 +177,22 @@ class PolarCenterKinematics(polar.PolarKinematics):
 
     def check_move(self, move):
         self._check_bounds(move)
-        # Exact stops at non-collinear junctions: Cartesian corner velocity
-        # alone cannot bound the polar motors' instantaneous velocity jump.
-        move.junction_deviation = 0.
+        if self._homing:
+            move.junction_deviation = 0.
+        else:
+            # Decorate only this Move, not the global Move class or tracked
+            # toolhead source. Run native look-ahead (including E) first.
+            native_junction = move.calc_junction
+            def calc_junction(previous):
+                native_junction(previous)
+                if not move.is_kinematic_move or not previous.is_kinematic_move:
+                    return
+                limit = corner_speed_limit(
+                    move.start_pos, previous.axes_r, move.axes_r,
+                    self.radial_velocity_change, self.angular_velocity_change)
+                move.max_start_v2 = min(move.max_start_v2, limit * limit)
+                move.max_mcr_start_v2 = min(move.max_mcr_start_v2, move.max_start_v2)
+            move.calc_junction = calc_junction
         if not (move.axes_d[0] or move.axes_d[1]):
             return
         fractions, crossing = split_parameters(
@@ -284,6 +323,8 @@ class PolarCenterKinematics(polar.PolarKinematics):
     def get_status(self, eventtime):
         result = super().get_status(eventtime)
         result['polar_center_rotations'] = self.center_rotations
+        result['max_radial_velocity_change'] = self.radial_velocity_change
+        result['max_angular_velocity_change'] = self.angular_velocity_change
         return result
 
 
