@@ -26,7 +26,8 @@ class InstallerTests(unittest.TestCase):
                         ignore=shutil.ignore_patterns(".git", "out", "__pycache__", "c_helper.so"))
         # The recovered local test checkout contains the legacy untracked
         # plugin file; official Klipper does not.
-        (self.klipper / "klippy/kinematics/polar_center.py").unlink(missing_ok=True)
+        for name in ("polar_center.py", "polar_native_arc.py"):
+            (self.klipper / "klippy/kinematics" / name).unlink(missing_ok=True)
         subprocess.run(["git", "init", "-q", str(self.klipper)], check=True)
         subprocess.run(["git", "-C", str(self.klipper), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.klipper), "-c", "user.name=Test",

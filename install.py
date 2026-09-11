@@ -18,6 +18,7 @@ from compatibility import fingerprint
 
 ROOT = Path(__file__).resolve().parent
 PLUGIN_FILE = "klippy/kinematics/polar_center.py"
+PLUGIN_FILES = (PLUGIN_FILE, "klippy/kinematics/polar_native_arc.py")
 LEGACY_FILES = ("klippy/chelper/kin_polar.c", "klippy/chelper/__init__.py")
 LEGACY_INSTALLED = {
     "klippy/chelper/kin_polar.c": "39c98789f1bb56d9c643511ddd0157f3a8ff068163bbd613f10fd3def1445d7d",
@@ -149,45 +150,52 @@ def preflight(klipper):
     fingerprint(klipper)
     legacy_plan(klipper)
     git_path(klipper, 'info/exclude')
-    tracked = subprocess.check_output(
-        ['git', '-C', str(klipper), 'ls-files', '--', PLUGIN_FILE], text=True)
-    if tracked.strip():
-        raise RuntimeError('polar_center.py is tracked in this Klipper checkout; '
-                           'preserving its Git history and index')
-    target = klipper / PLUGIN_FILE
-    if target.is_symlink() and target.resolve() != (ROOT / PLUGIN_FILE).resolve():
-        raise RuntimeError('Preserving an unmanaged polar_center.py symlink')
-    allowed = {digest(ROOT / PLUGIN_FILE),
-               '6e8cf8ade70dbe10275a1f031b6aae682420922881a242cf42061c959a103b7a',
-               '2f82db4aa174b1f964cabaf971ada517a92db5711e1810ba25c061263faacbfd'}
-    records = klipper / '.polar-center-upgrade/installed.json'
-    if records.is_file():
-        allowed.add(json.loads(records.read_text()).get(PLUGIN_FILE, {}).get('installed_sha256'))
-    if target.is_file() and not target.is_symlink() and digest(target) not in allowed:
-        raise RuntimeError('Preserving an independently modified polar_center.py')
+    for name in PLUGIN_FILES:
+        tracked = subprocess.check_output(
+            ['git', '-C', str(klipper), 'ls-files', '--', name], text=True)
+        if tracked.strip():
+            raise RuntimeError(name + ' is tracked in this Klipper checkout; '
+                               'preserving its Git history and index')
+        target = klipper / name
+        if target.is_symlink() and target.resolve() != (ROOT / name).resolve():
+            raise RuntimeError('Preserving an unmanaged symlink: ' + name)
+        if target.exists() and not target.is_file():
+            raise RuntimeError('Preserving an unmanaged path: ' + name)
+        allowed = {digest(ROOT / name)}
+        if name == PLUGIN_FILE:
+            allowed.update({
+                'aaa23b3a0a8cea37eef793e7eb5b92d2581082910daa6785e75bb21067dab36b',
+                '6e8cf8ade70dbe10275a1f031b6aae682420922881a242cf42061c959a103b7a',
+                '2f82db4aa174b1f964cabaf971ada517a92db5711e1810ba25c061263faacbfd'})
+            records = klipper / '.polar-center-upgrade/installed.json'
+            if records.is_file():
+                allowed.add(json.loads(records.read_text()).get(name, {}).get('installed_sha256'))
+        if target.is_file() and not target.is_symlink() and digest(target) not in allowed:
+            raise RuntimeError('Preserving an independently modified ' + name)
 
 
 def install_link(klipper, state_root):
-    source = ROOT / PLUGIN_FILE
-    target = klipper / PLUGIN_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink():
-        target.unlink()
-    elif target.exists():
-        if digest(target) != digest(source):
-            backup = state_root / ("preexisting-polar-center-" + time.strftime("%Y%m%d-%H%M%S.py"))
-            backup.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(target), backup)
-            print(f"Preserved the previous polar_center.py at {backup}")
-        else:
+    for name in PLUGIN_FILES:
+        source, target = ROOT / name, klipper / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_symlink():
             target.unlink()
-    target.symlink_to(source)
-    exclude = git_path(klipper, 'info/exclude')
-    marker = "/" + PLUGIN_FILE
-    previous = exclude.read_text() if exclude.exists() else ''
-    lines = previous.splitlines()
-    if marker not in lines:
-        atomic_write(exclude, previous.rstrip() + "\n" + marker + "\n")
+        elif target.exists():
+            if digest(target) != digest(source):
+                backup = state_root / ('preexisting-' + target.stem + '-'
+                                       + time.strftime('%Y%m%d-%H%M%S') + '-'
+                                       + uuid.uuid4().hex[:8] + '.py')
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(target), backup)
+                print(f'Preserved the previous {target.name} at {backup}')
+            else:
+                target.unlink()
+        target.symlink_to(source)
+        exclude = git_path(klipper, 'info/exclude')
+        marker = '/' + name
+        previous = exclude.read_text() if exclude.exists() else ''
+        if marker not in previous.splitlines():
+            atomic_write(exclude, previous.rstrip() + '\n' + marker + '\n')
 
 
 def main():

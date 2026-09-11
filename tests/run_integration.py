@@ -18,6 +18,7 @@ def main():
     parser.add_argument('--klipper', required=True, type=Path)
     parser.add_argument('--dictionary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--features', action='store_true', help='Enable retraction and native arcs')
     args = parser.parse_args()
     root, out = args.klipper.resolve(), args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -35,6 +36,9 @@ def main():
     config += '\n[force_move]\nenable_force_move: True\n[polar_center_audit]\n[gcode_arcs]\n'
     # Deliberately test pressure advance as well as synchronized XYZ/E.
     config = config.replace('[extruder]', '[extruder]\npressure_advance: 0.04')
+    if args.features:
+        config = config.replace('[printer]', '[printer]\ncenter_retract_length: 0.3\npolar_native_arcs: True')
+        config += '\n[firmware_retraction]\nretract_length: 0.4\n'
     cfg = out/'simulation.cfg'
     cfg.write_text(config)
     commands = ['G28', 'G90', 'M82', 'G1 Z10 F180', 'G1 X30 Y0 F600',
@@ -82,6 +86,26 @@ def main():
     move(30, 0)
     commands += ['POLAR_TEST_REJECT X=-101', 'POLAR_TEST_REJECT X=-30 Z=151',
                  'POLAR_TEST_REJECT X=-30 E=10000']
+    if args.features:
+        commands += ['M83', 'M221 S200', 'M220 S50', 'G92 E0']
+        for i in range(24):
+            commands.append(('G2' if i % 2 else 'G3') + ' X30 Y0 I-30 J0 E0.05 F1200')
+            e += .1
+            commands.append('POLAR_TEST_POSITION X=30 Y=0 E=%.9f' % e)
+            expected_endpoints += 1
+        commands += ['M221 S100', 'M220 S100', 'M82', 'G92 E%.9f' % e]
+        for cx, cy in [(20,20), (-20,20), (-20,-20), (20,-20)]:
+            move(cx+5, cy)
+            for cmd in ['G2', 'G3']:
+                e += .1
+                commands.append('%s X%g Y%g I-5 J0 E%.9f F1200' % (cmd,cx+5,cy,e))
+                commands.append('POLAR_TEST_POSITION X=%g Y=%g E=%.9f' % (cx+5,cy,e))
+                expected_endpoints += 1
+        # Origin intersection and helical arcs retain the segmented path.
+        move(20, 0)
+        commands += ['G3 X20 Y0 I-10 J0 F600', 'G3 X-20 Y0 Z11 I-20 J0 F600']
+        commands += ['POLAR_TEST_FEATURES', 'POLAR_TEST_ARC_REJECT']
+        move(30, 0)
     commands += ['M18', 'POLAR_TEST_REJECT X=-30']
     # Homing after multiple rotations, then fresh coordinate-frame anchor.
     commands += ['G28', 'G1 Z10 F180', 'G1 X30 Y0 F600', 'POLAR_TEST_ANCHOR']
@@ -111,11 +135,17 @@ def main():
     samples = re.findall(r'POLAR_AUDIT trajectory samples=(\d+)', text)
     result = dict(exit_code=process.returncode, endpoint_checks=endpoints,
                   expected_endpoints=expected_endpoints, stationary_rotations=rotations,
-                  rejected_move_checks=rejected, pressure_advance=.04,
+                  rejected_move_checks=rejected, pressure_advance=.04, features_enabled=args.features,
+                  native_arc_checks=text.count('POLAR_AUDIT native arc PASS'),
+                  retraction_checks=text.count('POLAR_AUDIT retraction PASS'),
                   trajectory_samples=int(samples[-1]) if samples else 0,
                   backend='Real Klippy/C helpers, hostsimulator MCU file-output')
     result['passed'] = (process.returncode == 0 and endpoints == expected_endpoints
-                        and rotations >= 120 and rejected == 4)
+                        and rotations >= 120 and rejected == 4
+                        and (not args.features or (result['native_arc_checks'] >= 32
+                             and result['retraction_checks'] >= 120
+                             and 'POLAR_AUDIT feature state PASS' in text
+                             and 'POLAR_AUDIT native arc rejection atomicity PASS' in text)))
     (out/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2))
     if not result['passed']:

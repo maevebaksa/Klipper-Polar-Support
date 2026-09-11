@@ -53,15 +53,24 @@ def derivative_bounds(start, end, move_length):
     if not xy_length or not move_length:
         return 0., 0., 0., 0.
     q = xy_length / move_length
-    h = abs(start[0] * dy - start[1] * dx) / move_length
-    rmin = polar.distance_to_center(start, end)
+    ux, uy = dx / xy_length, dy / xy_length
+    h = abs(start[0] * uy - start[1] * ux)
+    a0 = start[0] * ux + start[1] * uy
+    a1 = a0 + xy_length
+    closest = min(max(0., a0), a1)
+    rmin = math.hypot(h, closest)
     # Exactly radial center legs have constant angle and linear radius.
     if (math.hypot(*start[:2]) == 0.
         or math.hypot(*end[:2]) == 0. or h == 0.):
         return 0., 0., 0., q
     if rmin <= 0.:
         raise ValueError("Unsplit polar center crossing")
-    return h / rmin**2, 2. * h * q / rmin**3, h*h / rmin**3, q
+    # Exact extrema over the bounded segment, including interior peaks.
+    candidates = [a0, a1]
+    candidates += [a for a in (-h/math.sqrt(3.), h/math.sqrt(3.)) if a0 <= a <= a1]
+    angular_curvature = max(2.*q*q*h*abs(a)/(h*h+a*a)**2 for a in candidates)
+    radial_slope = q * max(abs(a)/math.hypot(h, a) for a in (a0, a1))
+    return q*h/rmin**2, angular_curvature, q*q*h*h/rmin**3, radial_slope
 
 
 def corner_speed_limit(position, incoming, outgoing, radial_change, angular_change):
@@ -100,6 +109,8 @@ class PolarCenterKinematics(polar.PolarKinematics):
         self._homing = False
         self.angle = 0.
         self.center_rotations = 0
+        self.center_retractions = 0
+        self._center_extruding = False
         if config.has_section('input_shaper'):
             raise config.error("polar_center does not support [input_shaper]; "
                                "remove that section for this experimental profile")
@@ -115,6 +126,10 @@ class PolarCenterKinematics(polar.PolarKinematics):
             'max_radial_velocity_change', min(1., self.radial_velocity), minval=0.)
         self.angular_velocity_change = config.getfloat(
             'max_angular_velocity_change', min(.02, self.v_rad_max), minval=0.)
+        self.center_retract_length = config.getfloat('center_retract_length', 0., minval=0.)
+        self.center_retract_speed = config.getfloat('center_retract_speed', 20., above=0.)
+        self.center_unretract_speed = config.getfloat('center_unretract_speed', 10., above=0.)
+        self.native_arcs = config.getboolean('polar_native_arcs', False)
         if self.rails[0].get_range()[0] != 0.:
             raise config.error("polar_center requires arm position_min: 0")
         self.bed = self.steppers[0]
@@ -128,7 +143,9 @@ class PolarCenterKinematics(polar.PolarKinematics):
         self.plugin_ffi = cffi.FFI()
         self.plugin_ffi.cdef(
             'struct stepper_kinematics; '
-            'struct stepper_kinematics *polar_center_stepper_alloc(void);')
+            'struct stepper_kinematics *polar_center_stepper_alloc(void); '
+            'struct stepper_kinematics *polar_arc_stepper_alloc(char, double, double, '
+            'double, double, double, double, double);')
         self.plugin_lib = self.plugin_ffi.dlopen(str(library))
         raw_sk = self.plugin_lib.polar_center_stepper_alloc()
         if raw_sk == self.plugin_ffi.NULL:
@@ -146,6 +163,9 @@ class PolarCenterKinematics(polar.PolarKinematics):
         # drip moves retain their native endstop synchronization.
         self._native_move = toolhead.move
         toolhead.move = self.move
+        if self.native_arcs:
+            from . import polar_native_arc
+            self.arc_support = polar_native_arc.NativeArcs(self, config)
 
     def set_position(self, newpos, homing_axes):
         super().set_position(newpos, homing_axes)
@@ -153,6 +173,7 @@ class PolarCenterKinematics(polar.PolarKinematics):
             self.angle = math.atan2(newpos[1], newpos[0])
 
     def home(self, homing_state):
+        self._center_extruding = False
         self._homing = True
         try:
             super().home(homing_state)
@@ -273,6 +294,29 @@ class PolarCenterKinematics(polar.PolarKinematics):
         self.angle = target
         self.center_rotations += 1
 
+    def _want_center_retract(self, start, end, incoming_extrusion):
+        firmware = self.printer.lookup_object('firmware_retraction', None)
+        return (self.center_retract_length > 0. and incoming_extrusion
+                and end[3] > start[3] and not getattr(firmware, 'is_retracted', False))
+
+    def _retract_pair(self, position):
+        pulled = list(position)
+        pulled[3] -= self.center_retract_length
+        return pulled, list(position)
+
+    def _center_turn(self, target, retract):
+        if not retract:
+            return self._rotate_at_center(target)
+        pulled, restored = self._retract_pair(self.toolhead.get_position())
+        try:
+            self._native_move(pulled, self.center_retract_speed)
+            self._rotate_at_center(target)
+            self._native_move(restored, self.center_unretract_speed)
+        except Exception:
+            self.printer.invoke_shutdown('polar_center retract/turn transition failed')
+            raise
+        self.center_retractions += 1
+
     def move(self, newpos, speed):
         if self._homing:
             return self._native_move(newpos, speed)
@@ -301,8 +345,25 @@ class PolarCenterKinematics(polar.PolarKinematics):
             legs.append(middle)
         legs.append(end)
         prev = start
+        incoming_extrusion = self._center_extruding
+        planned_angle = self.angle
         for leg in legs:
             self._preflight(prev, leg, speed)
+            if prev[0] == 0. and prev[1] == 0. and (leg[0] or leg[1]):
+                turning = abs(wrap_angle(math.atan2(leg[1], leg[0])-planned_angle)) > 1.e-12
+                if turning and self._want_center_retract(prev, leg, incoming_extrusion):
+                    pulled, restored = self._retract_pair(prev)
+                    self._preflight(prev, pulled, self.center_retract_speed)
+                    self._preflight(pulled, restored, self.center_unretract_speed)
+            if leg[0] == 0. and leg[1] == 0.:
+                if prev[0] or prev[1]:
+                    incoming_extrusion = leg[3] > prev[3]
+                    planned_angle = math.atan2(prev[1], prev[0])
+                elif leg[3] != prev[3]:
+                    incoming_extrusion = False
+            else:
+                incoming_extrusion = False
+                planned_angle = math.atan2(leg[1], leg[0])
             prev = leg
         for leg in legs:
             current = self.toolhead.get_position()
@@ -311,18 +372,27 @@ class PolarCenterKinematics(polar.PolarKinematics):
             if at_center and leaving:
                 target = math.atan2(leg[1], leg[0])
                 if abs(wrap_angle(target - self.angle)) > 1.e-12:
-                    self._rotate_at_center(target)
+                    self._center_turn(target, self._want_center_retract(
+                        current, leg, self._center_extruding))
             self._native_move(leg, speed)
             if leaving:
                 self.angle = math.atan2(leg[1], leg[0])
+                self._center_extruding = False
             elif current[0] != 0. or current[1] != 0.:
                 # An inward leg stops before a later departure/reorientation.
                 self.angle = math.atan2(current[1], current[0])
                 self.toolhead.limit_next_junction_speed(0.)
+                self._center_extruding = leg[3] > current[3]
+            elif leg[3] != current[3]:
+                self._center_extruding = False
 
     def get_status(self, eventtime):
         result = super().get_status(eventtime)
         result['polar_center_rotations'] = self.center_rotations
+        result['polar_center_retractions'] = self.center_retractions
+        if self.native_arcs:
+            result['polar_native_arc_count'] = self.arc_support.count
+            result['polar_native_arc_fallbacks'] = self.arc_support.fallbacks
         result['max_radial_velocity_change'] = self.radial_velocity_change
         result['max_angular_velocity_change'] = self.angular_velocity_change
         return result
