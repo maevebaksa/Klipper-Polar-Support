@@ -37,7 +37,8 @@ def main():
     # Deliberately test pressure advance as well as synchronized XYZ/E.
     config = config.replace('[extruder]', '[extruder]\npressure_advance: 0.04')
     if args.features:
-        config = config.replace('[printer]', '[printer]\ncenter_retract_length: 0.3\npolar_native_arcs: True')
+        config = config.replace('center_retract_length: 0\n', 'center_retract_length: 0.3\n')
+        config = config.replace('polar_native_arcs: False', 'polar_native_arcs: True')
         config += '\n[firmware_retraction]\nretract_length: 0.4\n'
     cfg = out/'simulation.cfg'
     cfg.write_text(config)
@@ -101,6 +102,22 @@ def main():
                 commands.append('%s X%g Y%g I-5 J0 E%.9f F1200' % (cmd,cx+5,cy,e))
                 commands.append('POLAR_TEST_POSITION X=%g Y=%g E=%.9f' % (cx+5,cy,e))
                 expected_endpoints += 1
+        # Partial arcs change endpoints; test Cartesian queue restoration and
+        # nonzero G92 XY offsets as well as absolute extrusion.
+        move(30, 0)
+        commands += ['G92 X130 Y100']
+        for cmd, points in [
+            ('G3', [(0,30), (-30,0), (0,-30), (30,0)]),
+            ('G2', [(0,-30), (-30,0), (0,30), (30,0)])]:
+            px, py = 30, 0
+            for x, y in points:
+                e += .05
+                commands.append('%s X%g Y%g I%g J%g E%.9f F1200'
+                                % (cmd,x+100,y+100,-px,-py,e))
+                commands.append('POLAR_TEST_POSITION X=%g Y=%g E=%.9f' % (x,y,e))
+                expected_endpoints += 1
+                px, py = x, y
+        commands += ['G92 X30 Y0']
         # Origin intersection and helical arcs retain the segmented path.
         move(20, 0)
         commands += ['G3 X20 Y0 I-10 J0 F600', 'G3 X-20 Y0 Z11 I-20 J0 F600']
@@ -142,7 +159,7 @@ def main():
                   backend='Real Klippy/C helpers, hostsimulator MCU file-output')
     result['passed'] = (process.returncode == 0 and endpoints == expected_endpoints
                         and rotations >= 120 and rejected == 4
-                        and (not args.features or (result['native_arc_checks'] >= 32
+                        and (not args.features or (result['native_arc_checks'] >= 40
                              and result['retraction_checks'] >= 120
                              and 'POLAR_AUDIT feature state PASS' in text
                              and 'POLAR_AUDIT native arc rejection atomicity PASS' in text)))

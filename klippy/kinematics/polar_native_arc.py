@@ -66,7 +66,8 @@ class NativeArcs:
         if not all(math.isfinite(v) for v in start+end+list(offset)+[speed]) or speed <= 0.:
             raise gcmd.error('Invalid native arc coordinate or speed')
         geometry = arc_geometry(start, end, offset, clockwise)
-        if geometry is None or geometry[5] <= 1.e-6:
+        if (geometry is None or geometry[5] <= 1.e-6
+                or geometry[2]*abs(geometry[4]) <= 1.e-6):
             return self.fallback(current, target, offset, clockwise, gcmd, absolute_e, alpha, beta, helical)
         self.execute(start, end, speed, geometry)
         gm.last_position[:] = end

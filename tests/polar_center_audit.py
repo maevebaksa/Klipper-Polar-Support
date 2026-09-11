@@ -221,7 +221,7 @@ class Audit:
 
     def features(self, gcmd):
         kin = self.kin
-        if kin.center_retractions < 120 or kin.arc_support.count != 32 or kin.arc_support.fallbacks < 4:
+        if kin.center_retractions < 120 or kin.arc_support.count != 40 or kin.arc_support.fallbacks < 4:
             raise gcmd.error('Unexpected native feature counters: %s' % kin.get_status(0))
         logging.info('POLAR_AUDIT feature state PASS')
 
