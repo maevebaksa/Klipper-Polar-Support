@@ -8,5 +8,10 @@
   "klippy/chelper/trapq.h": "ce9a8097b629dd8f09c640448971dd13bcea59f0e6a47eb22ad504acadc747c6",
   "klippy/chelper/list.h": "11d2c6b3c72e2fcd2843a52ab57a1c608200d95e40e3c0ad09d90c8219dd88ae",
   "klippy/chelper/itersolve.c": "46ee8563d3d63ce3c1b75e45cde8e2aeb24170c44b1574848358b4bbf70c9bcf",
-  "klippy/chelper/trapq.c": "71b107a56ed3b86f9396190450e9fb98bd2ab1308224db8b0b012cc203611ab1"
+  "klippy/chelper/trapq.c": "71b107a56ed3b86f9396190450e9fb98bd2ab1308224db8b0b012cc203611ab1",
+  "klippy/extras/gcode_arcs.py": "bcb9fcd2833031991a4e4a8c9d4454b0ad8eeea7f0ee75f8b9435a68c5af2fbe",
+  "klippy/extras/gcode_move.py": "f4200b863e64988aa192ad363af2563843c65feea14afa657b76b8d8656a4a37",
+  "klippy/extras/bed_mesh.py": "e1c381dba9859e569d091f95c8e6bb1c012b279619fcbbc9c41405ae77fb55f9",
+  "klippy/extras/firmware_retraction.py": "87d9ad3fe69bf5e563b5e1a68fad6d9346b4e128d3eb08b233347d757e4d4010",
+  "klippy/kinematics/extruder.py": "a38c3fb0f7c658fab4f2a52de1f633141bb4ba935c2925e84099871748ce6ef5"
 }

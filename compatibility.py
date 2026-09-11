@@ -14,7 +14,8 @@ def fingerprint(klipper):
             raise RuntimeError('Unsupported Klipper motion interface: ' + name
                                + '. Update Polar support to a compatible version.')
     parts = [ROOT / 'supported-interfaces.json', ROOT / 'csrc/polar_center.c',
-             ROOT / 'klippy/kinematics/polar_center.py']
+             ROOT / 'klippy/kinematics/polar_center.py',
+             ROOT / 'klippy/kinematics/polar_native_arc.py']
     return hashlib.sha256(b''.join(p.read_bytes() for p in parts)).hexdigest()
 
 

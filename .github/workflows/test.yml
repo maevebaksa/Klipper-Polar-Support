@@ -30,7 +30,7 @@ jobs:
           PYTHONPATH: /tmp/klipper/klippy
         run: |
           bash -n install.sh
-          python3 -m py_compile install.py auto_update.py klippy/kinematics/polar_center.py
+          python3 -m py_compile install.py auto_update.py klippy/kinematics/polar_center.py klippy/kinematics/polar_native_arc.py
           python3 -m unittest discover -s tests -v
       - name: Real Klippy motion simulation
         run: |
@@ -39,4 +39,5 @@ jobs:
           make -C /tmp/klipper -j2
           python3 tests/run_integration.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-results
           python3 tests/run_corner_benchmark.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-corners
+          python3 tests/run_integration.py --features --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-features
           test -z "$(git -C /tmp/klipper status --porcelain)"

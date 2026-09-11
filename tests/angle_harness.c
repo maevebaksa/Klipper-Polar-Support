@@ -23,3 +23,21 @@ double sample_angle(int patched, double commanded, double sx, double sy,
         return polar_center_angle_calc_position(&sk, &m, t);
     return upstream_angle(&sk, &m, t);
 }
+
+double sample_arc(int angular, double commanded, double cx, double cy,
+                  double radius, double angle, double inverse_radius,
+                  double radial_bias, double angular_bias, double distance)
+{
+    struct arc_stepper as = {
+        .sk = { .commanded_pos = commanded },
+        .cx = cx, .cy = cy, .radius = radius, .angle = angle,
+        .inverse_radius = inverse_radius,
+        .radial_bias = radial_bias, .angular_bias = angular_bias
+    };
+    struct move m = { .axes_r = { .x = 1. }, .start_v = 1. };
+    as.angular_bias += atan2(cy+radius*sin(angle), cx+radius*cos(angle))
+                       - arc_unwrapped_angle(&as, angle);
+    if (angular)
+        return arc_angle(&as.sk, &m, distance);
+    return arc_radius(&as.sk, &m, distance);
+}

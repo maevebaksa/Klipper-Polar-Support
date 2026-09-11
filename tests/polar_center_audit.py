@@ -11,6 +11,8 @@ class Audit:
         gcode.register_command('POLAR_TEST_ANCHOR', self.anchor)
         gcode.register_command('POLAR_TEST_POSITION', self.position)
         gcode.register_command('POLAR_TEST_REJECT', self.reject)
+        gcode.register_command('POLAR_TEST_FEATURES', self.features)
+        gcode.register_command('POLAR_TEST_ARC_REJECT', self.arc_reject)
         self.checks = 0
 
     def ready(self):
@@ -100,11 +102,73 @@ class Audit:
             self.checks += 1
             logging.info('POLAR_AUDIT rotation stationary XYZ/E PASS')
         self.kin._rotate_at_center = rotate
+        turn = self.kin._center_turn
+        def checked_turn(target, retract):
+            before = self.th.get_position()
+            turn(target, retract)
+            if before != self.th.get_position():
+                raise self.printer.command_error('Center retract changed logical E')
+            if retract:
+                logging.info('POLAR_AUDIT retraction PASS')
+        self.kin._center_turn = checked_turn
+        if self.kin.native_arcs:
+            self.install_arc_audit()
+
+    def install_arc_audit(self):
+        support = self.kin.arc_support
+        execute = support.execute
+        append = self.kin.trapq_append
+        def checked_execute(start, end, speed, geometry):
+            self.arc_geometry = geometry
+            self.arc_samples = 0
+            execute(start, end, speed, geometry)
+            if not self.arc_samples:
+                raise self.printer.command_error('Native arc was not sampled')
+            logging.info('POLAR_AUDIT native arc PASS samples=%d', self.arc_samples)
+        support.execute = checked_execute
+        def checked_append(*args):
+            if args[0] != support.trapq:
+                return append(*args)
+            _, _, at, ct, dt, _, _, _, _, _, _, sv, cv, accel = args
+            cx, cy, radius, angle, sweep, _, _ = self.arc_geometry
+            direction = math.copysign(1., sweep)
+            s, velocity = 0., sv
+            for duration, a in [(at,accel), (ct,0.), (dt,-accel)]:
+                if not duration:
+                    continue
+                for i in range(201):
+                    t = duration*i/200.
+                    phi = angle + direction*(s+velocity*t+.5*a*t*t)/radius
+                    x, y = cx+radius*math.cos(phi), cy+radius*math.sin(phi)
+                    dx, dy = -direction*math.sin(phi), direction*math.cos(phi)
+                    ddx, ddy = -math.cos(phi)/radius, -math.sin(phi)/radius
+                    r = math.hypot(x,y)
+                    dot, cross = x*dx+y*dy, x*dy-y*dx
+                    rp, ap = dot/r, cross/r**2
+                    rpp = (dx*dx+dy*dy+x*ddx+y*ddy)/r-dot**2/r**3
+                    app = (x*ddy-y*ddx)/r**2-2.*cross*dot/r**4
+                    v = velocity+a*t
+                    for name, actual, limit in [
+                        ('radial velocity', abs(rp*v), self.kin.radial_velocity),
+                        ('angular velocity', abs(ap*v), self.kin.v_rad_max),
+                        ('radial acceleration', abs(rp*a+rpp*v*v), self.kin.radial_accel),
+                        ('angular acceleration', abs(ap*a+app*v*v), self.kin.angular_accel),
+                        ('Cartesian acceleration', math.hypot(a,v*v/radius), self.th.max_accel)]:
+                        if actual > limit*(1+1.e-5)+1.e-6:
+                            raise self.printer.command_error('Native arc '+name+' exceeds bound')
+                    self.arc_samples += 1
+                s += velocity*duration+.5*a*duration**2
+                velocity += a*duration
+            return append(*args)
+        self.kin.trapq_append = checked_append
 
     def anchor(self, gcmd):
         self.th.flush_step_generation()
         self.anchor_steps = self.kin.bed.get_mcu_position()
         self.anchor_angle = math.atan2(*self.th.get_position()[1::-1])
+        extruder = self.th.get_extruder().extruder_stepper.stepper
+        self.anchor_e_steps = extruder.get_mcu_position()
+        self.anchor_e = self.th.get_position()[3]
 
     def position(self, gcmd):
         self.th.flush_step_generation()
@@ -123,6 +187,10 @@ class Audit:
         arm = self.kin.rails[0].get_steppers()[0]
         if abs(arm.get_commanded_position()-math.hypot(*p[:2])) > arm.get_step_dist():
             raise gcmd.error('Physical radial position mismatch')
+        extruder = self.th.get_extruder().extruder_stepper.stepper
+        actual_e = self.anchor_e + (extruder.get_mcu_position()-self.anchor_e_steps)*extruder.get_step_dist()
+        if abs(actual_e-p[3]) > 1.1*extruder.get_step_dist():
+            raise gcmd.error('Physical extrusion mismatch: %g vs %g' % (actual_e,p[3]))
         self.checks += 1
         logging.info('POLAR_AUDIT endpoint PASS checks=%d', self.checks)
         logging.info('POLAR_AUDIT trajectory samples=%d', self.trajectory_checks)
@@ -150,6 +218,32 @@ class Audit:
             raise gcmd.error('Invalid request generated steps')
         self.checks += 1
         logging.info('POLAR_AUDIT rejected request atomicity PASS')
+
+    def features(self, gcmd):
+        kin = self.kin
+        if kin.center_retractions < 120 or kin.arc_support.count != 40 or kin.arc_support.fallbacks < 4:
+            raise gcmd.error('Unexpected native feature counters: %s' % kin.get_status(0))
+        logging.info('POLAR_AUDIT feature state PASS')
+
+    def arc_reject(self, gcmd):
+        self.th.flush_step_generation()
+        before = self.th.get_position()
+        steppers = self.kin.get_steppers()+[self.th.get_extruder().extruder_stepper.stepper]
+        counts = [s.get_mcu_position() for s in steppers]
+        # Valid endpoint, but full circle exceeds radial bounds; then unsafe E.
+        for params in [{'I': '-80', 'J': '0', 'F': '600'},
+                       {'I': '20', 'J': '0', 'E': '100000', 'F': '600'}]:
+            try:
+                command = self.printer.lookup_object('gcode').create_gcode_command('G3', 'G3', params)
+                self.kin.arc_support.arcs.cmd_G3(command)
+            except self.printer.command_error:
+                pass
+            else:
+                raise gcmd.error('Invalid native arc accepted')
+            self.th.flush_step_generation()
+            if before != self.th.get_position() or counts != [s.get_mcu_position() for s in steppers]:
+                raise gcmd.error('Invalid native arc queued partial motion')
+        logging.info('POLAR_AUDIT native arc rejection atomicity PASS')
 
 
 def load_config(config):
