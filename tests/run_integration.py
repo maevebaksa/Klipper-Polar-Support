@@ -19,7 +19,10 @@ def main():
     parser.add_argument('--dictionary', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--features', action='store_true', help='Enable retraction and native arcs')
+    parser.add_argument('--extended', action='store_true', help='Queue continuity, G1 fitting and active mesh')
     args = parser.parse_args()
+    if args.extended and not args.features:
+        parser.error('--extended requires --features')
     root, out = args.klipper.resolve(), args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     sample = Path(__file__).parents[1]/'config/polar3d-printrboard-center.cfg'
@@ -40,6 +43,9 @@ def main():
         config = config.replace('center_retract_length: 0\n', 'center_retract_length: 0.3\n')
         config = config.replace('polar_native_arcs: False', 'polar_native_arcs: True')
         config += '\n[firmware_retraction]\nretract_length: 0.4\n'
+    if args.extended:
+        config = config.replace('polar_native_arcs: True', 'polar_native_arcs: True\npolar_auto_arcs: True')
+        config += '\n[bed_mesh]\nmesh_min: -80,-80\nmesh_max: 80,80\nprobe_count: 3,3\nmesh_pps: 0,0\nfade_start: 1\nfade_end: 10\n'
     cfg = out/'simulation.cfg'
     cfg.write_text(config)
     commands = ['G28', 'G90', 'M82', 'G1 Z10 F180', 'G1 X30 Y0 F600',
@@ -123,6 +129,56 @@ def main():
         commands += ['G3 X20 Y0 I-10 J0 F600', 'G3 X-20 Y0 Z11 I-20 J0 F600']
         commands += ['POLAR_TEST_FEATURES', 'POLAR_TEST_ARC_REJECT']
         move(30, 0)
+    if args.extended:
+        # Consecutive arcs remain queued, rather than flushing after each one.
+        for _ in range(2):
+            px,py = 30,0
+            for x,y in [(0,30),(-30,0),(0,-30),(30,0)]:
+                e += .05
+                commands.append('G3 X%g Y%g I%g J%g E%.9f F1200' % (x,y,-px,-py,e))
+                px,py = x,y
+        move(30,0)
+        # Ordinary slicer polylines are fitted below the G-code parser.
+        for i in range(1,81):
+            a = math.pi*i/80
+            e += .01
+            commands.append('G1 X%.9f Y%.9f E%.9f F1200' % (30*math.cos(a),30*math.sin(a),e))
+        move(-30,0)
+        # Native origin turns also preserve net E with automatic retraction.
+        move(20,0)
+        for command in ['G2','G3']:
+            e += .1
+            commands += ['%s X20 Y0 I-10 J0 E%.9f F1200' % (command,e),
+                         'POLAR_TEST_POSITION X=20 Y=0 E=%.9f' % e]
+            expected_endpoints += 1
+        # Rounded slicer endpoints are repaired and execute natively.
+        move(30,0)
+        e += .05
+        commands += ['G3 X0.001 Y30.001 I-30 J0 E%.9f F1200' % e,
+                     'POLAR_TEST_POSITION X=0.001 Y=30.001 E=%.9f' % e]
+        expected_endpoints += 1
+        e += .05
+        commands += ['G3 X-30 Y0 I-0.001 J-30.001 E%.9f F1200' % e,
+                     'POLAR_TEST_POSITION X=-30 Y=0 E=%.9f' % e]
+        expected_endpoints += 1
+        move(30,0,z=.5)
+        commands += ['POLAR_TEST_MESH', 'G1 Z0.5 F180']
+        e += .1
+        commands += ['G3 X30 Y0 I-30 J0 E%.9f F1200' % e,
+                     'POLAR_TEST_POSITION X=30 Y=0 Z=0.575 E=%.9f' % e]
+        expected_endpoints += 1
+        # G1 fitting also works with active mesh when its height bound fits.
+        for i in range(1,161):
+            a = 2*math.pi*i/160
+            e += .01
+            commands.append('G1 X%.9f Y%.9f E%.9f F1200' % (30*math.cos(a),30*math.sin(a),e))
+        commands.append('POLAR_TEST_POSITION X=30 Y=0 Z=0.575 E=%.9f' % e)
+        expected_endpoints += 1
+        e += .1
+        commands += ['G3 X30 Y0 Z5 I-30 J0 E%.9f F1200' % e,
+                     'POLAR_TEST_POSITION X=30 Y=0 Z=5.041666667 E=%.9f' % e,
+                     'POLAR_TEST_CONTINUOUS', 'BED_MESH_CLEAR']
+        expected_endpoints += 1
     commands += ['M18', 'POLAR_TEST_REJECT X=-30']
     # Homing after multiple rotations, then fresh coordinate-frame anchor.
     commands += ['G28', 'G1 Z10 F180', 'G1 X30 Y0 F600', 'POLAR_TEST_ANCHOR']
@@ -150,9 +206,13 @@ def main():
     rotations = text.count('POLAR_AUDIT rotation stationary XYZ/E PASS')
     rejected = text.count('POLAR_AUDIT rejected request atomicity PASS')
     samples = re.findall(r'POLAR_AUDIT trajectory samples=(\d+)', text)
-    result = dict(exit_code=process.returncode, endpoint_checks=endpoints,
+    extended_stats = re.findall(r'continuous features PASS moving=(\d+) fitted=(\d+) mesh=(\d+)', text)
+    moving, fitted, mesh_spans = map(int, extended_stats[-1]) if extended_stats else (0,0,0)
+    result = dict(moving_native_junctions=moving, fitted_arcs=fitted, mesh_spans=mesh_spans,
+                  exit_code=process.returncode, endpoint_checks=endpoints,
                   expected_endpoints=expected_endpoints, stationary_rotations=rotations,
-                  rejected_move_checks=rejected, pressure_advance=.04, features_enabled=args.features,
+                  rejected_move_checks=rejected, pressure_advance=.04, features_enabled=args.features, extended=args.extended,
+                  physical_curve_checks=text.count('POLAR_AUDIT physical curves PASS'),
                   native_arc_checks=text.count('POLAR_AUDIT native arc PASS'),
                   retraction_checks=text.count('POLAR_AUDIT retraction PASS'),
                   trajectory_samples=int(samples[-1]) if samples else 0,
@@ -162,7 +222,8 @@ def main():
                         and (not args.features or (result['native_arc_checks'] >= 40
                              and result['retraction_checks'] >= 120
                              and 'POLAR_AUDIT feature state PASS' in text
-                             and 'POLAR_AUDIT native arc rejection atomicity PASS' in text)))
+                             and 'POLAR_AUDIT native arc rejection atomicity PASS' in text))
+                        and (not args.extended or 'POLAR_AUDIT continuous features PASS' in text))
     (out/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2))
     if not result['passed']:

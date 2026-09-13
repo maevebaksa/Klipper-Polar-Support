@@ -196,24 +196,32 @@ class PolarCenterKinematics(polar.PolarKinematics):
             move.limit_speed(self.max_z_velocity * ratio,
                              self.max_z_accel * ratio)
 
-    def check_move(self, move):
-        self._check_bounds(move)
+    def decorate_junction(self, move):
         if self._homing:
             move.junction_deviation = 0.
-        else:
-            # Decorate only this Move, not the global Move class or tracked
-            # toolhead source. Run native look-ahead (including E) first.
-            native_junction = move.calc_junction
-            def calc_junction(previous):
+            return
+        native_junction = move.calc_junction
+        def calc_junction(previous):
+            incoming = getattr(previous, 'end_tangent', previous.axes_r)
+            outgoing = getattr(move, 'start_tangent', move.axes_r)
+            old_prev, old_move = previous.axes_r, move.axes_r
+            try:
+                previous.axes_r, move.axes_r = incoming, outgoing
                 native_junction(previous)
-                if not move.is_kinematic_move or not previous.is_kinematic_move:
-                    return
-                limit = corner_speed_limit(
-                    move.start_pos, previous.axes_r, move.axes_r,
-                    self.radial_velocity_change, self.angular_velocity_change)
-                move.max_start_v2 = min(move.max_start_v2, limit * limit)
-                move.max_mcr_start_v2 = min(move.max_mcr_start_v2, move.max_start_v2)
-            move.calc_junction = calc_junction
+            finally:
+                previous.axes_r, move.axes_r = old_prev, old_move
+            if not move.is_kinematic_move or not previous.is_kinematic_move:
+                return
+            limit = corner_speed_limit(move.start_pos, incoming, outgoing,
+                self.radial_velocity_change, self.angular_velocity_change)
+            move.max_start_v2 = min(move.max_start_v2, limit*limit)
+            move.max_mcr_start_v2 = min(move.max_mcr_start_v2, move.max_start_v2)
+        move.calc_junction = calc_junction
+
+    def check_move(self, move):
+        self._check_bounds(move)
+        move.requested_speed = math.sqrt(move.max_cruise_v2)
+        self.decorate_junction(move)
         if not (move.axes_d[0] or move.axes_d[1]):
             return
         fractions, crossing = split_parameters(
@@ -393,6 +401,8 @@ class PolarCenterKinematics(polar.PolarKinematics):
         if self.native_arcs:
             result['polar_native_arc_count'] = self.arc_support.count
             result['polar_native_arc_fallbacks'] = self.arc_support.fallbacks
+            result['polar_fitted_arcs'] = self.arc_support.fitted
+            result['polar_mesh_arc_spans'] = self.arc_support.mesh_spans
         result['max_radial_velocity_change'] = self.radial_velocity_change
         result['max_angular_velocity_change'] = self.angular_velocity_change
         return result

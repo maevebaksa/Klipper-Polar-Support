@@ -1,74 +1,89 @@
-# Validation record — 0.4.0
+# Validation record — 0.5.0
 
 Tested against official Klipper commit
-`f0892d82b0f1c1228454f09eb508eddde2250f4b`. GitHub Actions runs the unit,
-installer, default motion, corner benchmark, and optional feature tests.
+`f0892d82b0f1c1228454f09eb508eddde2250f4b` using real Klippy, compiled C helpers,
+step generation/compression and hostsimulator MCU file-output mode. No printer
+is contacted. Software tests do not establish physical print quality.
 
-The suite uses real Klippy, compiled C helpers, step generation/compression,
-and a hostsimulator MCU dictionary in file-output mode. It contacts no printer.
-See the checks on [PR #2](https://github.com/maevebaksa/Klipper-Polar-Support/pull/2)
-for the result tied to each commit.
+| Check | Result |
+|---|---:|
+| Unit, geometry, installer and update tests | 46 tests |
+| Default feature-off endpoint assertions | 232 |
+| Extended logical and motor endpoint assertions | 291 |
+| Native curve spans checked against motor limits | 300 |
+| Native junctions carrying nonzero speed | 247 |
+| Automatically fitted G1 arcs, including active mesh | 120 |
+| Explicit mesh arc spans | 121 |
+| Center retractions with equal restoration | 135 |
+| Center rotations with stationary radial/Z/E motors | 152 |
+| Physical in-curve motor checks | 51 batches |
+| Pressure advance in motion regressions | 0.04 s |
+| Repeat installation and final full Klipper Git status | Clean |
 
-## New regression coverage
+These are synthetic regression counts, not a speed or surface-quality claim.
+The machine-readable extended result is `tests/results/v05-extended.json`.
 
-- 38 unit/installer/update tests, including sampled exact line derivatives,
-  swept-arc radius extrema, continuous C solver winding, and transform gates.
-- Default feature-off motion regression with 232 logical and motor endpoint
-  assertions, 146 stationary center turns, and four atomic invalid-move checks.
-- Optional feature regression: repeated center retraction with equal restoration,
-  full and partial CW/CCW arcs, offset circles in all quadrants, and line/arc
-  transitions. It verifies physical E steps with 0.04 s pressure advance,
-  M82/M83, M220/M221, and G92 E/XY offsets.
-- Samples submitted arc trapezoids against independent analytic radial/angular
-  velocity and acceleration formulas, plus Cartesian centripetal acceleration.
-- Rejects complete native arcs whose interior exceeds the radial limit and
-  unsafe extrusion, without partial motor or commanded-position changes.
-- Origin-touching and helical arcs use the fallback path. Unit tests reject
-  active mesh/fade/custom transforms from native execution.
-- Repeated installation leaves the full Klipper Git status clean. Both managed
-  Python links are excluded; tracked and unrelated user changes remain protected.
+## What is checked
 
-## Acceleration calculation
+The regression retains the existing homing, near-origin lines, exact center
+crossings, extruder validation, pressure advance and relative/absolute extrusion
+checks. New cases cover:
 
-For a straight segment, let `h` be perpendicular distance to the XY line,
-`a` signed distance along that line from its closest point, and `q` the
-ratio of XY to XYZ path length. The exact derivatives are:
+- Full/partial CW and CCW arcs in all quadrants, changing endpoints and G92 XY/E
+  offsets, M220/M221 overrides, and continuous queued arc sequences.
+- Arc-to-line tangent junctions and preservation of extruder junction limits.
+- Helical XYZ/E motion with 3D path length and Z velocity/acceleration limits.
+- Native arcs through the origin, stopped reorientation, and center retraction.
+- Bounded repair of rounded slicer endpoints, keeping both endpoints exact.
+- Automatic G1 fitting with and without an active mesh, bounded chord deviation,
+  unchanged endpoints and net E, and rejection of excessive geometric changes.
+- Active mesh correction, interpolation cells, fade transitions, fade target and
+  tool offset. Unit tests compare interpolated span heights against the mesh.
+- Invalid complete-arc radial bounds and unsafe extrusion rejected atomically.
+- Recorded MCU step counts sampled *inside* curves against expected radial,
+  angular and Z positions, as well as endpoint and final extrusion checks.
 
-- `|theta'| = q*h/(h*h+a*a)`
-- `|theta''| = 2*q*q*h*abs(a)/(h*h+a*a)^2`
-- `r'' = q*q*h*h/(h*h+a*a)^(3/2)`
-- `|r'| = q*abs(a)/sqrt(h*h+a*a)`
+Submitted trapezoids are sampled with independent analytic derivative formulas.
+Junction tests compare actual incoming/outgoing tangents and motor velocities.
+The persistent C timeline preserves full-circle winding and is pruned only after
+step generation while retaining live-position history. The live position query
+uses actual curve geometry; raw trapq dumps remain linear skeleton diagnostics.
 
-Angular curvature peaks at `a = +/-h/sqrt(3)` when those points lie inside
-the segment; all extrema are bounded over the actual finite segment.
-Acceleration remains conservatively budgeted between tangential and curvature
-terms. Corners retain bounded instantaneous motor velocity changes from v0.3,
-not a claim of finite acceleration at a mathematically sharp corner.
+## Mathematical bounds
 
-Native circles centered on the polar origin use `r'=r''=theta''=0` and
-`|theta'|=1/R`. Other circles use conservative derivative bounds based on the
-swept minimum radius. Native arcs stop at their boundaries; no junction blending,
-spline interpolation, or automatic G1 curve fitting is claimed.
+Straight-segment bounds retain the v0.4 exact derivative extrema. For native
+curves, acceleration includes tangential and centripetal terms. Centered and
+origin-tangent circles have specialized bounds; other offset circles use
+conservative bounds based on their minimum radius. Native junctions use curve
+endpoint tangents with Klipper look-ahead and motor velocity-change limits.
+This is not a finite-jerk planner at sharp corners.
 
-The C arc solver computes continuous winding analytically. This matters because
-Klipper updates a solver's commanded position at the end of a trapezoid phase;
-nearest-angle unwrapping against that value would jump during long full-circle
-cruises. The C regression explicitly holds that value fixed while sampling turns.
+For mesh correction with Lipschitz slope bound L over XY arc-length interval h,
+linear interpolation error is at most L*h/2. The bound is computed from the
+actual dense mesh table, clamping, fade target and fade slope, so it remains
+valid across cell and fade boundaries. XY remains circular in every span.
+
+G1 fitting preserves vertices and bounds the sagitta between each source chord
+and its fitted arc. Active-mesh fits must also pass the mesh-height error bound.
+Nominally constant Z and matching extrusion distribution are required.
 
 ## Reproduce
 
-Install into the supported Klipper checkout and build its hostsimulator dictionary:
+Install the plugin in the supported Klipper checkout and build its hostsimulator
+dictionary, then run:
 
 ```bash
 KLIPPER_PATH=/path/to/klipper PYTHONPATH=/path/to/klipper/klippy \
   python3 -m unittest discover -s tests -v
-python3 tests/run_integration.py --features --klipper /path/to/klipper \
-  --dictionary /path/to/klipper/out/klipper.dict --output /tmp/polar-features
-python3 tests/run_corner_benchmark.py --klipper /path/to/klipper \
-  --dictionary /path/to/klipper/out/klipper.dict --output /tmp/polar-corners
+python3 tests/run_integration.py --features --extended --klipper /path/to/klipper \
+  --dictionary /path/to/klipper/out/klipper.dict --output /tmp/polar-extended
 ```
 
-Historical v0.3 benchmark JSON files remain in `tests/results/`; they are not
-v0.4 timing claims. Current synthetic timings are printed by CI. User G-code and
-printer logs are not bundled. Software results do not establish physical motor
-torque, calibration, backlash, adhesion, extrusion tuning, or surface quality.
+GitHub Actions additionally runs the default regression, feature regression and
+existing corner benchmark. Historical v0.3 JSON files in `tests/results/` remain
+historical; they are not v0.5 timing claims. User printer logs and G-code are not
+bundled.
+
+Non-XY planes and unknown custom transforms retain upstream segmentation.
+Mechanical center stops remain necessary. Physical torque, backlash, nozzle
+calibration, adhesion and extrusion tuning require printer testing.
