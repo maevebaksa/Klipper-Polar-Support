@@ -1,0 +1,19 @@
+{
+  "moving_native_junctions": 247,
+  "fitted_arcs": 120,
+  "mesh_spans": 121,
+  "exit_code": 0,
+  "endpoint_checks": 291,
+  "expected_endpoints": 291,
+  "stationary_rotations": 152,
+  "rejected_move_checks": 4,
+  "pressure_advance": 0.04,
+  "features_enabled": true,
+  "extended": true,
+  "physical_curve_checks": 51,
+  "native_arc_checks": 300,
+  "retraction_checks": 135,
+  "trajectory_samples": 153525,
+  "backend": "Real Klippy/C helpers, hostsimulator MCU file-output",
+  "passed": true
+}

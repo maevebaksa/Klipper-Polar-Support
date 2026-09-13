@@ -13,5 +13,6 @@
   "klippy/extras/gcode_move.py": "f4200b863e64988aa192ad363af2563843c65feea14afa657b76b8d8656a4a37",
   "klippy/extras/bed_mesh.py": "e1c381dba9859e569d091f95c8e6bb1c012b279619fcbbc9c41405ae77fb55f9",
   "klippy/extras/firmware_retraction.py": "87d9ad3fe69bf5e563b5e1a68fad6d9346b4e128d3eb08b233347d757e4d4010",
-  "klippy/kinematics/extruder.py": "a38c3fb0f7c658fab4f2a52de1f633141bb4ba935c2925e84099871748ce6ef5"
+  "klippy/kinematics/extruder.py": "a38c3fb0f7c658fab4f2a52de1f633141bb4ba935c2925e84099871748ce6ef5",
+  "klippy/extras/motion_report.py": "d07e03860fcb80d1f09279a44e33e8a47f3ffd18034c521cb8a4f3ec8c4a9fb1"
 }

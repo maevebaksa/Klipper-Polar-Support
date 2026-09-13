@@ -12,9 +12,10 @@ is compiled as a separate shared library under this repository. It does not
 replace the tracked `kin_polar.c` or `chelper/__init__.py` files. The installer
 also restores the recognized previous Polar patch while preserving backups.
 
-Version **0.4.0** adds optional center retraction, exact derivative bounds for
-straight moves, and native XY circular arcs. The existing arm and bed corner
-velocity-change limits remain available. Exact center crossings stop and reorient.
+Version **0.5.0** queues native curves through Klipper look-ahead, including
+helical Z and active bed mesh. It adds bounded repair of rounded arc coordinates
+and optional fitting of ordinary G1 extrusion segments. Exact center passages
+use the same stopped reorientation and optional retraction as straight lines.
 
 ## Install
 
@@ -116,78 +117,120 @@ To compare the old stop-at-corners behavior during an idle test, use
 afterward. Center reorientation stops remain enabled at all settings. Segmented G2/G3 arcs
 benefit from the same corner limits; native arcs are an optional separate path.
 
-## Center retraction and native curves
+## Native curves and center retraction
 
-Add these options to your existing `[printer]` section after installing v0.4.0:
+These options belong in your existing `[printer]` section:
 
 ```ini
+polar_native_arcs: True
 center_retract_length: 0.3
 center_retract_speed: 20
 center_unretract_speed: 10
-polar_native_arcs: True
+
+# Optional fitting of ordinary G1 extrusion paths:
+polar_auto_arcs: True
+polar_fit_tolerance: 0.01
+
+# Maximum nominal-circle repair and mesh-height approximation, in mm:
+polar_arc_tolerance: 0.02
+polar_mesh_tolerance: 0.005
 ```
 
-The 0.3 mm retract is a starting value to tune, not a calibration result.
-Omitting these options leaves retraction disabled (`0`) and native arcs disabled
-(`False`). The acceleration calculation improvement needs no configuration.
+Retraction and native arcs remain disabled unless enabled explicitly. G1 fitting
+also defaults to disabled. Curve tolerance settings are read when native arcs
+are enabled. The 0.3 mm retract is a starting value to tune.
 
-Retraction occurs when extrusion arrives at the exact center and continues
-after a bed turn. The sequence is stop, retract, rotate, unretract the same
-length, resume. Net commanded E is unchanged. Length and speeds are physical
-filament mm and mm/s, independent of M221 flow scaling. Normal extruder
-temperature, distance, velocity, and acceleration checks remain enforced.
-Travel-only turns and an already active G10 firmware retract do not add a
-second automatic retract. A separate E move at the center clears the continuing
-extrusion state. This is center-pause control, not automatic travel retraction
-for the whole print.
+### Continuous arc motion
 
-Native arcs require **G2/G3 with I/J in the XY plane and constant Z**, using
-Klipper's absolute-XYZ arc syntax. Slicer arc fitting or ArcWelder can supply
-these commands. G1-only files remain polylines. G2/G3 handlers are loaded
-automatically when enabled; an existing `[gcode_arcs]` section is accepted.
+XY G2/G3 commands with I/J now enter the normal Klipper look-ahead queue. They
+can carry speed through tangent arc-to-arc and arc-to-line junctions. Junction
+limits use the actual curve tangents, preserving Cartesian and extruder limits
+and the existing radial/angular velocity-change caps. Real corners and reversals
+can still require slowing or stopping. M400, dwells and other flushes still stop.
 
-The C solver evaluates the circle directly from actual traveled arc length.
-It maintains continuous winding across full turns and synchronizes extrusion
-using that same arc length. M82/M83, G92, M220/M221, pressure advance, and normal
-extruder limits are retained. Complete swept-radius bounds are checked before
-motion. A standalone arc respects the single-move minimum-cruise cap.
+Persistent C solvers evaluate the curve directly without swapping steppers or
+forcing a stop for every command. Winding remains continuous through full
+circles. Helical arcs are supported: their linear Z component contributes to
+path length, extrusion ratio, Z speed and Z acceleration limits. The live motion
+position is corrected to the curve. Raw trapq diagnostic streams still contain
+linear skeleton entries; use stepper data or the live-position query to inspect
+actual curve motion.
 
-**Each native arc stops at both ends.** This release does not blend lines into
-arcs, blend adjacent arcs at speed, fit curves internally, or provide spline/
-jerk-limited motion. Many short arcs can therefore be slower than G1 cornering.
-Large arcs remove chord junctions within the arc but do not guarantee smoother
-physical prints.
+### Rounded arc coordinates
 
-These cases retain Klipper's segmented arc path:
+Small endpoint inconsistencies can be repaired by moving the circle center to
+the perpendicular chord bisector. Both requested endpoints remain exact. The
+center displacement plus radius change is bounded by `polar_arc_tolerance`
+(default 0.02 mm). This bounds the change of corresponding points on the nominal
+circle. Larger or ill-conditioned inconsistencies are rejected before motion;
+they are not silently accepted as a badly distorted curve.
 
-- An active mesh or other nonidentity move transform.
-- Helical arcs, non-XY planes, or additional toolhead axes.
-- Arcs passing through/within 0.000001 mm of the polar origin.
-- Endpoints whose circle radii differ by more than 0.000001 mm, or tiny arcs.
+### Bed mesh
 
-An inactive built-in bed mesh with zero fade offset is allowed. The strict
-endpoint tolerance can cause rounded slicer arcs to fall back; fallback counts
-make that visible. `[gcode_arcs] resolution` affects fallback segmentation only.
-Nozzle-center offsets, steps/mm, flow calibration, and physical tuning remain
-your existing settings.
+The built-in bed mesh is supported with its offsets, fade and fade target.
+XY stays circular. Mesh height is approximated by linear-Z arc spans, which
+remain connected through look-ahead. A global slope bound on the actual dense
+mesh table and fade function determines the span size so height approximation
+error stays within `polar_mesh_tolerance` (default 0.005 mm). A request requiring
+more than 4096 spans is rejected; inspect the mesh or adjust the tolerance.
 
-Kinematics status exposes `polar_center_retractions`,
-`polar_native_arc_count`, and `polar_native_arc_fallbacks` (the arc counters
-appear when native arcs are enabled).
+A curved mesh path can still be slower because its Z speed and acceleration
+limits apply. This approximates the interpolated mesh, not the physical bed.
+
+### Ordinary G1 files
+
+With `polar_auto_arcs: True`, compatible pairs of queued G1 extrusion moves can
+be fitted to circular arcs inside Klipper. A postprocessor is no longer required
+for those paths. The fitted arc passes through the original vertices; deviation
+from the original chords is bounded by `polar_fit_tolerance` (default 0.01 mm).
+This is an explicit geometric tolerance: details smaller than it can be rounded.
+
+Fitting is deliberately selective: constant nominal Z, matching requested
+speed, positive extrusion and matching extrusion distribution. Built-in bed
+mesh is supported when a height-error bound can certify the fit; custom
+transforms are preserved. Moves near the center, travel moves, extra-axis moves
+and moves with callbacks are preserved. Existing G2/G3 commands are never
+refitted. Slicer arc fitting or ArcWelder remains useful for producing longer
+arc commands.
+
+### Center passages
+
+An XY arc through the origin is split exactly at the origin. It stops, optionally
+retracts, turns the bed, restores the same filament length, then continues as a
+curve. That stop is a mechanical requirement of a nonnegative-radius shuttle;
+removing it would require a different mechanism or a changed toolpath. No
+printable center exclusion is added.
+
+Automatic retraction applies when extrusion arrives at the center and continues
+after the turn. Net E is unchanged. Length and speeds are physical filament mm
+and mm/s, independent of M221. Travel-only turns and an active G10 firmware
+retract do not add a second retract. A separate E move at the center clears the
+continuing-extrusion state. This is center-pause control, not general travel
+retraction for an entire print.
+
+### Remaining scope
+
+Native interpolation supports XY-plane arcs, including helical Z. Non-XY planes,
+tiny arcs and unknown third-party move transforms retain Klipper segmentation.
+Absolute XYZ/IJ arc syntax follows Klipper. Splines, general sharp-corner rounding and finite-jerk trajectories are not implemented.
+Stock cornering still permits bounded instantaneous motor velocity changes.
+
+Kinematics status exposes `polar_center_retractions`, `polar_native_arc_count`,
+`polar_native_arc_fallbacks`, `polar_fitted_arcs`, and `polar_mesh_arc_spans`.
+Counts reflect queued operations. Enabling native curves automatically loads
+the G2/G3 handlers; an existing `[gcode_arcs]` section is accepted.
+
+Nozzle offsets, homing, steps/mm and extrusion calibration remain your settings.
 
 ## Acceleration calculations
 
-Straight moves now use exact extrema over each segment for angular velocity,
-angular curvature, radial curvature, and radial slope, including interior
-angular-acceleration peaks. This removes some unnecessary slowing from the
-previous conservative bounds. Motor acceleration combines the tangential
-term (`position_derivative * path_acceleration`) with the curvature term
-(`position_second_derivative * path_speed_squared`).
-
-The planner still conservatively shares acceleration budgets between those
-terms. Native offset circles use conservative analytic bounds, with a special
-case for circles centered on the bed axis. This is not time-optimal trajectory
-planning or a finite-jerk guarantee at corners.
+Straight moves use exact extrema over each segment for angular velocity,
+angular curvature, radial curvature and radial slope. Motor acceleration
+combines the tangential term with the curvature term proportional to speed
+squared. Budgets remain conservative. Native circles centered on or tangent to
+the polar origin have specialized analytic bounds. Other offset circles use
+conservative bounds based on swept minimum radius. These are not time-optimal
+or jerk-limited trajectories.
 
 ## Initial dry run
 
@@ -225,7 +268,8 @@ calibration before printing.
   supported. Pressure advance is supported by the test suite.
 - Exact crossings physically require the nonnegative-radius shuttle to stop and
   reverse; center oozing or a seam remains possible.
-- Bed mesh, probes, and third-party move transforms are not physically validated.
+- Bed mesh has software regression coverage; probes and third-party transforms
+  are not physically validated.
 - Signed negative radial travel and angular-index homing are not added.
 - A compiler is required on the host, as with Klipper's normal C helper build.
 - Compatibility checks reject untested changes to Klipper's motion interfaces.

@@ -13,7 +13,10 @@ class Audit:
         gcode.register_command('POLAR_TEST_REJECT', self.reject)
         gcode.register_command('POLAR_TEST_FEATURES', self.features)
         gcode.register_command('POLAR_TEST_ARC_REJECT', self.arc_reject)
+        gcode.register_command('POLAR_TEST_MESH', self.mesh)
+        gcode.register_command('POLAR_TEST_CONTINUOUS', self.continuous)
         self.checks = 0
+        self.native_history = []
 
     def ready(self):
         self.th = self.printer.lookup_object('toolhead')
@@ -64,6 +67,9 @@ class Audit:
                                    *append.original_position,
                                    ux, uy, uz, start_v, cruise_v, accel)
         def checked_append(*args):
+            support = getattr(self.kin, 'arc_support', None)
+            if support and support.emitting and hasattr(support.emitting[0], 'geometry'):
+                return original_append(*args)
             _, start_time, at, ct, dt, x, y, z, ux, uy, uz, sv, cv, accel = args
             old = self.previous_trapezoid
             if old is not None and abs(start_time-old[0]) < 1.e-6:
@@ -116,51 +122,60 @@ class Audit:
 
     def install_arc_audit(self):
         support = self.kin.arc_support
-        execute = support.execute
-        append = self.kin.trapq_append
-        def checked_execute(start, end, speed, geometry):
-            self.arc_geometry = geometry
-            self.arc_samples = 0
-            execute(start, end, speed, geometry)
-            if not self.arc_samples:
-                raise self.printer.command_error('Native arc was not sampled')
-            logging.info('POLAR_AUDIT native arc PASS samples=%d', self.arc_samples)
-        support.execute = checked_execute
-        def checked_append(*args):
-            if args[0] != support.trapq:
-                return append(*args)
-            _, _, at, ct, dt, _, _, _, _, _, _, sv, cv, accel = args
-            cx, cy, radius, angle, sweep, _, _ = self.arc_geometry
-            direction = math.copysign(1., sweep)
-            s, velocity = 0., sv
-            for duration, a in [(at,accel), (ct,0.), (dt,-accel)]:
-                if not duration:
-                    continue
+        original = support.record_curve
+        self.native_junctions = 0
+        def record(when, move):
+            cx,cy,radius,angle,sweep,_,_ = move.geometry
+            q = radius*abs(sweep)/move.move_d
+            direction = math.copysign(q,sweep)
+            s, velocity, samples = 0.,move.start_v,0
+            for duration,a in [(move.accel_t,move.accel), (move.cruise_t,0.), (move.decel_t,-move.accel)]:
+                if not duration: continue
                 for i in range(201):
                     t = duration*i/200.
-                    phi = angle + direction*(s+velocity*t+.5*a*t*t)/radius
-                    x, y = cx+radius*math.cos(phi), cy+radius*math.sin(phi)
-                    dx, dy = -direction*math.sin(phi), direction*math.cos(phi)
-                    ddx, ddy = -math.cos(phi)/radius, -math.sin(phi)/radius
+                    phi = angle+direction*(s+velocity*t+.5*a*t*t)/radius
+                    x,y = cx+radius*math.cos(phi),cy+radius*math.sin(phi)
+                    dx,dy = -direction*math.sin(phi),direction*math.cos(phi)
+                    ddx,ddy = -q*q*math.cos(phi)/radius,-q*q*math.sin(phi)/radius
                     r = math.hypot(x,y)
-                    dot, cross = x*dx+y*dy, x*dy-y*dx
-                    rp, ap = dot/r, cross/r**2
+                    if r < 1.e-5: continue
+                    dot,cross = x*dx+y*dy,x*dy-y*dx
+                    rp,ap = dot/r,cross/r**2
                     rpp = (dx*dx+dy*dy+x*ddx+y*ddy)/r-dot**2/r**3
                     app = (x*ddy-y*ddx)/r**2-2.*cross*dot/r**4
                     v = velocity+a*t
-                    for name, actual, limit in [
-                        ('radial velocity', abs(rp*v), self.kin.radial_velocity),
-                        ('angular velocity', abs(ap*v), self.kin.v_rad_max),
-                        ('radial acceleration', abs(rp*a+rpp*v*v), self.kin.radial_accel),
-                        ('angular acceleration', abs(ap*a+app*v*v), self.kin.angular_accel),
-                        ('Cartesian acceleration', math.hypot(a,v*v/radius), self.th.max_accel)]:
-                        if actual > limit*(1+1.e-5)+1.e-6:
-                            raise self.printer.command_error('Native arc '+name+' exceeds bound')
-                    self.arc_samples += 1
+                    for name,actual,limit in [
+                        ('radial velocity',abs(rp*v),self.kin.radial_velocity),
+                        ('angular velocity',abs(ap*v),self.kin.v_rad_max),
+                        ('radial acceleration',abs(rp*a+rpp*v*v),self.kin.radial_accel),
+                        ('angular acceleration',abs(ap*a+app*v*v),self.kin.angular_accel),
+                        ('Cartesian acceleration',math.hypot(a,q*q*v*v/radius),self.th.max_accel),
+                        ('Z velocity',abs(move.start_tangent[2]*v),self.kin.max_z_velocity),
+                        ('Z acceleration',abs(move.start_tangent[2]*a),self.kin.max_z_accel)]:
+                        if actual > limit*(1+1.e-4)+1.e-5:
+                            raise self.printer.command_error('Native arc '+name+' exceeds bound: %g > %g' % (actual,limit))
+                    samples += 1
                 s += velocity*duration+.5*a*duration**2
                 velocity += a*duration
-            return append(*args)
-        self.kin.trapq_append = checked_append
+            old = self.previous_trapezoid
+            if old is not None and abs(when-old[0]) < 1.e-6 and math.dist(old[1],move.start_pos[:3]) < 1.e-6:
+                x,y = move.start_pos[:2]
+                r = math.hypot(x,y)
+                vx = move.start_tangent[0]*move.start_v-old[2][0]*old[3]
+                vy = move.start_tangent[1]*move.start_v-old[2][1]*old[3]
+                if r < 1.e-6:
+                    if move.start_v > 1.e-6 or old[3] > 1.e-6:
+                        raise self.printer.command_error('Nonzero native center junction')
+                elif (abs((x*vx+y*vy)/r) > self.kin.radial_velocity_change+1.e-6
+                      or abs((x*vy-y*vx)/r**2) > self.kin.angular_velocity_change+1.e-6):
+                    raise self.printer.command_error('Native junction motor jump exceeded')
+                if move.start_v > 1.e-6: self.native_junctions += 1
+            endtime = when+move.accel_t+move.cruise_t+move.decel_t
+            self.previous_trapezoid = (endtime,move.end_pos[:3],move.end_tangent,move.end_v)
+            original(when,move)
+            self.native_history.append((when,move))
+            logging.info('POLAR_AUDIT native arc PASS samples=%d moving_junctions=%d',samples,self.native_junctions)
+        support.record_curve = record
 
     def anchor(self, gcmd):
         self.th.flush_step_generation()
@@ -169,6 +184,11 @@ class Audit:
         extruder = self.th.get_extruder().extruder_stepper.stepper
         self.anchor_e_steps = extruder.get_mcu_position()
         self.anchor_e = self.th.get_position()[3]
+        self.anchor_z_steps = self.kin.rails[1].get_steppers()[0].get_mcu_position()
+        self.anchor_z = self.th.get_position()[2]
+        self.anchor_r_steps = self.kin.rails[0].get_steppers()[0].get_mcu_position()
+        self.anchor_r = math.hypot(*self.th.get_position()[:2])
+        self.native_history = []
 
     def position(self, gcmd):
         self.th.flush_step_generation()
@@ -191,11 +211,66 @@ class Audit:
         actual_e = self.anchor_e + (extruder.get_mcu_position()-self.anchor_e_steps)*extruder.get_step_dist()
         if abs(actual_e-p[3]) > 1.1*extruder.get_step_dist():
             raise gcmd.error('Physical extrusion mismatch: %g vs %g' % (actual_e,p[3]))
+        zstep = self.kin.rails[1].get_steppers()[0]
+        actual_z = self.anchor_z+(zstep.get_mcu_position()-self.anchor_z_steps)*zstep.get_step_dist()
+        if abs(actual_z-p[2]) > 1.1*zstep.get_step_dist():
+            raise gcmd.error('Physical Z endpoint mismatch')
+        self.check_physical_curves(gcmd)
         self.checks += 1
         logging.info('POLAR_AUDIT endpoint PASS checks=%d', self.checks)
         logging.info('POLAR_AUDIT trajectory samples=%d', self.trajectory_checks)
         logging.info('POLAR_AUDIT junction checks=%d moving=%d',
                      self.junction_checks, self.moving_junctions)
+
+    def check_physical_curves(self, gcmd):
+        checked = 0
+        now = self.th.print_time
+        arm = self.kin.rails[0].get_steppers()[0]
+        zstep = self.kin.rails[1].get_steppers()[0]
+        for when,move in self.native_history:
+            duration = move.accel_t+move.cruise_t+move.decel_t
+            if when < now-20.: continue
+            for i in range(1,20):
+                t = duration*i/20.
+                at,ct = move.accel_t,move.cruise_t
+                if t <= at: s = move.start_v*t+.5*move.accel*t*t
+                elif t <= at+ct: s = .5*(move.start_v+move.cruise_v)*at+move.cruise_v*(t-at)
+                else:
+                    dt=t-at-ct
+                    s = .5*(move.start_v+move.cruise_v)*at+move.cruise_v*ct+move.cruise_v*dt-.5*move.accel*dt*dt
+                cx,cy,r,a,sweep,_,_ = move.geometry
+                f = s/move.move_d
+                x,y = cx+r*math.cos(a+sweep*f),cy+r*math.sin(a+sweep*f)
+                expected_r,expected_a = math.hypot(x,y),math.atan2(y,x)
+                actual_r = self.anchor_r+(arm.get_past_mcu_position(when+t)-self.anchor_r_steps)*arm.get_step_dist()
+                actual_a = self.anchor_angle+(self.kin.bed.get_past_mcu_position(when+t)-self.anchor_steps)*self.kin.bed.get_step_dist()
+                expected_z = move.start_pos[2]+f*(move.end_pos[2]-move.start_pos[2])
+                actual_z = self.anchor_z+(zstep.get_past_mcu_position(when+t)-self.anchor_z_steps)*zstep.get_step_dist()
+                if abs(actual_r-expected_r) > 1.2*arm.get_step_dist():
+                    raise gcmd.error('Physical curved radial trajectory mismatch')
+                if expected_r > 1.e-6 and abs(math.remainder(actual_a-expected_a,2*math.pi)) > 1.2*self.kin.bed.get_step_dist():
+                    raise gcmd.error('Physical curved angular trajectory mismatch')
+                if abs(actual_z-expected_z) > 1.2*zstep.get_step_dist():
+                    raise gcmd.error('Physical curved Z trajectory mismatch')
+                checked += 1
+        self.native_history = []
+        if checked: logging.info('POLAR_AUDIT physical curves PASS samples=%d',checked)
+
+    def mesh(self, gcmd):
+        self.th.flush_step_generation()
+        from .bed_mesh import ZMesh
+        params = dict(min_x=-80.,max_x=80.,min_y=-80.,max_y=80.,
+            x_count=3,y_count=3,mesh_x_pps=0,mesh_y_pps=0,algo='direct',tension=.2)
+        zmesh = ZMesh(params,'test')
+        zmesh.build_mesh([[-.3,-.1,.1],[-.2,0.,.2],[-.1,.1,.3]])
+        self.printer.lookup_object('bed_mesh').set_mesh(zmesh)
+
+    def continuous(self, gcmd):
+        self.th.flush_step_generation()
+        support = self.kin.arc_support
+        if self.native_junctions < 6 or support.fitted < 75 or support.mesh_spans < 2:
+            raise gcmd.error('Continuous feature check failed: moving=%d fitted=%d mesh=%d' % (self.native_junctions,support.fitted,support.mesh_spans))
+        logging.info('POLAR_AUDIT continuous features PASS moving=%d fitted=%d mesh=%d', self.native_junctions,support.fitted,support.mesh_spans)
 
     def reject(self, gcmd):
         self.th.flush_step_generation()
@@ -221,7 +296,7 @@ class Audit:
 
     def features(self, gcmd):
         kin = self.kin
-        if kin.center_retractions < 120 or kin.arc_support.count != 40 or kin.arc_support.fallbacks < 4:
+        if kin.center_retractions < 120 or kin.arc_support.count != 44 or kin.arc_support.fallbacks != 0:
             raise gcmd.error('Unexpected native feature counters: %s' % kin.get_status(0))
         logging.info('POLAR_AUDIT feature state PASS')
 

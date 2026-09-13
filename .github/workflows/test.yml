@@ -40,4 +40,5 @@ jobs:
           python3 tests/run_integration.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-results
           python3 tests/run_corner_benchmark.py --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-corners
           python3 tests/run_integration.py --features --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-features
+          python3 tests/run_integration.py --features --extended --klipper /tmp/klipper --dictionary /tmp/klipper/out/klipper.dict --output /tmp/polar-extended
           test -z "$(git -C /tmp/klipper status --porcelain)"

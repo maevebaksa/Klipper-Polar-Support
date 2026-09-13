@@ -110,3 +110,110 @@ polar_arc_stepper_alloc(char type, double cx, double cy, double radius,
     a->sk.active_flags = AF_X;
     return &a->sk;
 }
+
+// Persistent curve timeline shared by the radial, bed and Z solvers.
+// Registration/pruning occur between Klipper's synchronous step-generation
+// calls. Callbacks only read the timeline; only the bed initializes winding.
+struct path_curve {
+    double p[15]; // time, at, ct, dt, sv, cv, accel, cx, cy, R, phi, sweep, z0, z1, L
+    double valid_until, angle_bias;
+    int angle_ready;
+};
+struct path_context {
+    struct path_curve *curves;
+    int count, capacity;
+};
+struct path_stepper {
+    struct stepper_kinematics sk;
+    struct path_context *context;
+    char type;
+};
+void *polar_path_alloc(void) { return calloc(1, sizeof(struct path_context)); }
+void polar_path_clear(struct path_context *ctx) { ctx->count = 0; }
+void polar_path_free(struct path_context *ctx) {
+    if (ctx) { free(ctx->curves); free(ctx); }
+}
+void polar_path_close(struct path_context *ctx, double time) {
+    if (ctx->count && ctx->curves[ctx->count-1].valid_until > time)
+        ctx->curves[ctx->count-1].valid_until = time;
+}
+int polar_path_append(struct path_context *ctx, double *params) {
+    if (ctx->count == ctx->capacity) {
+        int size = ctx->capacity ? 2*ctx->capacity : 64;
+        void *buffer = realloc(ctx->curves, size*sizeof(struct path_curve));
+        if (!buffer) return -1;
+        ctx->curves = buffer; ctx->capacity = size;
+    }
+    polar_path_close(ctx, params[0]);
+    struct path_curve *c = &ctx->curves[ctx->count++];
+    memset(c, 0, sizeof(*c));
+    memcpy(c->p, params, sizeof(c->p));
+    c->valid_until = INFINITY;
+    return 0;
+}
+void polar_path_prune(struct path_context *ctx, double before) {
+    int n=0;
+    while (n<ctx->count && ctx->curves[n].valid_until < before) n++;
+    if (n) {
+        memmove(ctx->curves, ctx->curves+n, (ctx->count-n)*sizeof(struct path_curve));
+        ctx->count -= n;
+    }
+}
+static struct path_curve *path_find(struct path_context *ctx, double time) {
+    int lo=0, hi=ctx->count;
+    while (lo<hi) { int mid=(lo+hi)/2;
+        if (ctx->curves[mid].p[0] <= time) lo=mid+1; else hi=mid; }
+    if (!lo || time >= ctx->curves[lo-1].valid_until) return NULL;
+    return &ctx->curves[lo-1];
+}
+static double path_distance(struct path_curve *c, double time, double *velocity) {
+    double *p=c->p, t=fmax(0.,time-p[0]), s=0.;
+    if (t<p[1]) { *velocity=p[4]+p[6]*t; return p[4]*t+.5*p[6]*t*t; }
+    s=.5*(p[4]+p[5])*p[1]; t-=p[1];
+    if (t<p[2]) { *velocity=p[5]; return s+p[5]*t; }
+    s+=p[5]*p[2]; t-=p[2];
+    if (t<p[3]) { *velocity=p[5]-p[6]*t; return s+p[5]*t-.5*p[6]*t*t; }
+    *velocity=0.; return p[14];
+}
+int polar_path_query(struct path_context *ctx, double time, double *out) {
+    struct path_curve *c=path_find(ctx,time);
+    if (!c) return 0;
+    double velocity, *p=c->p, f=path_distance(c,time,&velocity)/p[14];
+    double phi=p[10]+p[11]*f;
+    out[0]=p[7]+p[9]*cos(phi); out[1]=p[8]+p[9]*sin(phi);
+    out[2]=p[12]+(p[13]-p[12])*f; out[3]=velocity;
+    return 1;
+}
+static double path_calc(struct stepper_kinematics *sk, struct move *m, double t) {
+    struct path_stepper *ps=(void *)sk;
+    double time=m->print_time+t;
+    struct path_curve *c=path_find(ps->context,time);
+    if (c) {
+        double v, *p=c->p, f=path_distance(c,time,&v)/p[14];
+        double phi=p[10]+p[11]*f;
+        if (ps->type=='z') return p[12]+(p[13]-p[12])*f;
+        if (ps->type=='r') return hypot(p[7]+p[9]*cos(phi),p[8]+p[9]*sin(phi));
+        struct arc_stepper a={.cx=p[7],.cy=p[8],.radius=p[9],
+                              .angle=p[10]+p[11]*.5};
+        // Tangent-circle pieces never cross the zero of their half-angle cosine.
+        if (fabs(a.radius-hypot(a.cx,a.cy)) < 1.e-10)
+            a.radius=hypot(a.cx,a.cy);
+        if (!c->angle_ready) {
+            double initial=arc_unwrapped_angle(&a,p[10]);
+            c->angle_bias=nearbyint((sk->commanded_pos-initial)/(2.*M_PI))*2.*M_PI;
+            c->angle_ready=1;
+        }
+        return arc_unwrapped_angle(&a,phi)+c->angle_bias;
+    }
+    if (ps->type=='a') return polar_center_angle_calc_position(sk,m,t);
+    struct coord p=plugin_move_get_coord(m,t);
+    return ps->type=='z' ? p.z : hypot(p.x,p.y);
+}
+struct stepper_kinematics *polar_path_stepper_alloc(struct path_context *ctx, char type) {
+    struct path_stepper *ps=calloc(1,sizeof(*ps));
+    if (!ps) return NULL;
+    ps->context=ctx; ps->type=type;
+    ps->sk.calc_position_cb=path_calc;
+    ps->sk.active_flags=AF_X|AF_Y|AF_Z;
+    return &ps->sk;
+}

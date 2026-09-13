@@ -83,9 +83,9 @@ class ArcGeometryTests(unittest.TestCase):
         gm = SimpleNamespace(move_transform=mesh)
         self.assertTrue(support.transform_supported(gm))
         mesh.z_mesh = object()
-        self.assertFalse(support.transform_supported(gm))
+        self.assertTrue(support.transform_supported(gm))
         mesh.z_mesh, mesh.fade_target = None, .1
-        self.assertFalse(support.transform_supported(gm))
+        self.assertTrue(support.transform_supported(gm))
         gm.move_transform = SimpleNamespace()
         self.assertFalse(support.transform_supported(gm))
         gm.move_transform = None
